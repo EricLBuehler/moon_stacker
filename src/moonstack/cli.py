@@ -48,6 +48,8 @@ def main(argv=None) -> int:
     ap.add_argument("--saturation", type=float, default=12.0, help="colour boost of the mineral image (default 12)")
     ap.add_argument("--no-colour-flatten", action="store_true",
                     help="keep the smooth colour slope across the disc in the mineral image")  # fmt: skip
+    ap.add_argument("--no-partial-decode", action="store_true",
+                    help="always decode whole frames with LibRaw (slower; for troubleshooting)")  # fmt: skip
     ap.add_argument("-j", "--jobs", type=int, default=0, help="worker count (default: all cores)")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
@@ -61,7 +63,7 @@ def main(argv=None) -> int:
 
     cfg = Config(
         keep=a.keep, scale=a.scale, radius=a.radius, kappa=a.kappa, local=not a.no_local, chroma_align=not a.no_chroma_align, wb=a.wb,
-        psf_sigma=a.psf_sigma, reference=a.reference, sharpen_iters=a.sharpen_iters, saturation=a.saturation, flatten_colour=not a.no_colour_flatten, jobs=a.jobs, quiet=a.quiet,
+        psf_sigma=a.psf_sigma, reference=a.reference, sharpen_iters=a.sharpen_iters, saturation=a.saturation, flatten_colour=not a.no_colour_flatten, partial_decode=not a.no_partial_decode, jobs=a.jobs, quiet=a.quiet,
     )  # fmt: skip
     out = a.out or a.folder / "moonstack_out"
     try:

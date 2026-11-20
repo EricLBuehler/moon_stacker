@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import numpy as np
 from tqdm import tqdm
 
 from . import align, finish
-from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one, sony_colour
+from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one, sony_colour, tiles_reference
 
 
 @dataclass
@@ -32,6 +33,7 @@ class Config:
     sharpen_iters: int = 25
     saturation: float = 12.0
     flatten_colour: bool = True  # remove the smooth colour slope across the disc in the mineral image
+    partial_decode: bool = True  # decode only the tiles around the moon when the format allows
     jobs: int = 0  # 0 = all cores
     quiet: bool = False
 
@@ -134,11 +136,14 @@ def _even(v: float) -> int:
     return int(round(v / 2.0)) * 2
 
 
-def _ingest(paths, jobs, log):
+def _ingest(paths, jobs, log, partial_decode=True):
     """Decode every file and gather moon-centred crops on a common canvas."""
+    # Sony tiled RAWs can be decoded just around the moon, if a check against
+    # LibRaw on the first file passes.
+    tiles = tiles_reference(paths[0]) if partial_decode else None
     results = []
     with ProcessPoolExecutor(max_workers=jobs) as ex:
-        for r in tqdm(ex.map(ingest_one, [str(p) for p in paths]), total=len(paths),
+        for r in tqdm(ex.map(partial(ingest_one, tiles=tiles), [str(p) for p in paths]), total=len(paths),
                       desc="decode", disable=log is None, unit="frame"):  # fmt: skip
             results.append(r)
 
@@ -198,7 +203,7 @@ def run(folder: Path, cfg: Config) -> Result:
         raise RuntimeError(f"no RAW files found in {folder}")
     say(f"{len(paths)} files in {folder}")
 
-    frames, tmp_path, recs, dropped, meta = _ingest(paths, min(jobs, 16), log)
+    frames, tmp_path, recs, dropped, meta = _ingest(paths, min(jobs, 16), log, cfg.partial_decode)
     try:
         return _process(frames, recs, dropped, meta, cfg, say, jobs, t_start)
     finally:
@@ -214,6 +219,9 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
     black = meta.black
     say(f"{n} usable frames, working area {cw}x{ch} px"
         + (f", {len(dropped)} dropped" if dropped else ""))  # fmt: skip
+    n_fast = sum(r.get("decoder") == "tiles" for r in recs)
+    if n_fast:
+        say(f"decoded only the area around the moon in {n_fast} of {n} files (checked against a full decode)")
     clipped = float(np.mean([r["clipped_frac"] for r in recs]))
     if clipped > 1e-4:
         say(f"warning: {100 * clipped:.2f}% of pixels near the moon are saturated")
@@ -420,6 +428,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         "frames_found": len(recs) + len(dropped),
         "frames_stacked": len(kept),
         "frames_dropped": len(dropped),
+        "decoded_partially": sum(r.get("decoder") == "tiles" for r in recs),
         "reference": Path(recs[ref_i]["path"]).name,
         "moon_drift_px": float(np.hypot(np.ptp(xs), np.ptp(ys))),
         "moon_size_px": [int(np.median([r["bbox"][2] for r in recs])), int(np.median([r["bbox"][3] for r in recs]))],

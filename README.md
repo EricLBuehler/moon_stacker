@@ -31,6 +31,9 @@ Stacking options (`--keep`, `--scale`, `--radius`, ...) need a full run.
 ## How it works
 
 1. **Decode** each RAW to its undemosaiced Bayer mosaic (LibRaw via `rawpy`), find the moon, crop around it.
+   Sony tiled lossless ARW files are decoded only around the moon (about ten times faster); this is
+   verified bit-for-bit against LibRaw on the first file of every run, and anything else falls back to
+   LibRaw. `--no-partial-decode` forces the slow path.
 2. **Score** every frame for sharpness; the sharpest `--keep` fraction is stacked.
 3. **Align** to the sharpest frame: shift and rotation to sub-pixel accuracy, then a local
    warp field measured on a grid of patches to undo atmospheric distortion.
@@ -64,6 +67,7 @@ badly off for the a7R VI.
 
 ```
 uv run pytest                           # end-to-end on a synthetic burst
+MOONSTACK_SONY_SAMPLE=/path/to/file.ARW uv run pytest   # also check the Sony tile decoder against LibRaw
 uv run python tests/bench_synth.py      # accuracy against ground truth vs a conventional stack
 ```
 

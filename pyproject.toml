@@ -9,6 +9,7 @@ dependencies = [
     "opencv-python-headless>=4.9",
     "numba>=0.60",
     "rawpy>=0.23",
+    "imagecodecs>=2024.1",
     "tifffile>=2024.1",
     "pillow>=10",
     "tqdm>=4.66",
