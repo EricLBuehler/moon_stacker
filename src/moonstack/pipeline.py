@@ -15,7 +15,7 @@ import numpy as np
 from tqdm import tqdm
 
 from . import align, finish
-from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one
+from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one, sony_colour
 
 
 @dataclass
@@ -25,11 +25,12 @@ class Config:
     radius: float = 0.75  # drizzle kernel half-width in sensor pixels
     kappa: float = 3.0  # outlier rejection threshold in sigmas (0 = off)
     local: bool = True  # correct turbulence warping with a local field
+    chroma_align: bool = True  # register red and blue to green (lens colour fringing, atmospheric dispersion)
     wb: str = "daylight"  # daylight | as-shot
     psf_sigma: float | None = None  # override the measured blur
     reference: str | None = None  # file name to align everything to (default: sharpest)
     sharpen_iters: int = 25
-    saturation: float = 6.0
+    saturation: float = 12.0
     jobs: int = 0  # 0 = all cores
     quiet: bool = False
 
@@ -216,16 +217,49 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
 
     # 4. Bayer drizzle in three passes: the first gives the mean and scatter that
     #    the following passes use to throw out outliers.
-    from .stack import Stacker  # imported late: numba start-up is slow
+    from .stack import Stacker, measure_channel_shift  # imported late: numba start-up is slow
 
     stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)
     full = [align.half_to_full(w) for w in warps]
 
+    # Red and blue land slightly displaced from green: the lens magnifies each
+    # colour differently (so the displacement depends on where the moon sits on
+    # the sensor, which changes through the burst) and the atmosphere adds a
+    # constant offset. Model both per colour, in sensor coordinates, as
+    #     position_in_colour = mag * position_in_green + b
+    origins = np.array([r["canvas_origin"] for r in recs], dtype=np.float64)
+    mag, b = np.ones(3), np.zeros((3, 2))
+
+    def chan_for(i):
+        return np.column_stack([mag, (mag - 1)[:, None] * origins[i] + b])
+
     def one_pass(desc, reject):
         for i in tqdm(kept, desc=desc, disable=cfg.quiet, unit="frame"):
-            stacker.add(frames[i], gains[i], full[i], fields[i], f_off, f_step, reject, cfg.kappa)
+            stacker.add(frames[i], gains[i], full[i], fields[i], f_off, f_step, reject, cfg.kappa, chan_for(i))
 
     one_pass("stack", False)
+    chroma_residual = None
+    if cfg.chroma_align:
+        # Where the reference area's origin falls on the sensor, averaged over the burst.
+        t_bar = np.mean([full[i][:, 2] + origins[i] for i in kept], axis=0)
+        for round_ in range(2):
+            m = measure_channel_shift(stacker.result(), cfg.scale)
+            if m is None:
+                if round_ == 0:
+                    say("could not measure colour-channel alignment; leaving channels as they are")
+                break
+            # Largest displacement anywhere in the working area, in pixels.
+            chroma_residual = float(np.abs(m[:, 1:]).max() + np.abs(m[:, 0] - 1).max() * max(ch, cw) / 2)
+            # Small, noisy stacks can show ~0.1 px of spurious shift; real lens and
+            # atmosphere effects worth correcting are larger.
+            if round_ == 1 or chroma_residual < 0.2:
+                break
+            # m describes the uncorrected stack; turn it into the sensor model.
+            b = b + m[:, 1:] - (m[:, 0] - 1)[:, None] * t_bar
+            mag = mag * m[:, 0]
+            say(f"colour channels vs green: red {np.hypot(*m[0, 1:]):.2f} px, blue {np.hypot(*m[2, 1:]):.2f} px; correcting")
+            stacker.reset()
+            one_pass("restack", False)
     if cfg.kappa > 0:
         stacker.finish_first_pass()
         one_pass("reject", True)
@@ -235,15 +269,28 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
     rej_frac = stacker.rejected / max(1.0, 4.0 * len(kept) * stack_cam.shape[0] * stack_cam.shape[1])
 
     # 5. Colour and sharpening.
+    # Prefer the camera's own colour data over LibRaw's tables, which lag new bodies.
+    colour_source = "LibRaw"
+    own = sony_colour(Path(recs[ref_i]["path"]))
+    if own is not None:
+        meta.wb_daylight, meta.cam_srgb = own
+        colour_source = "camera metadata"
     wb = meta.wb_daylight if cfg.wb == "daylight" else meta.wb_as_shot
     wb_used = cfg.wb
     if wb is None:
         wb = meta.wb_as_shot if meta.wb_as_shot is not None else np.ones(3, np.float32)
         wb_used = "as-shot" if meta.wb_as_shot is not None else "none"
-    if meta.cam_xyz is None:
-        say("note: no colour matrix for this camera; colours are white-balanced sensor RGB")
+    if meta.cam_srgb is not None:
+        matrix = meta.cam_srgb
+    else:
+        matrix = finish.camera_to_srgb(meta.cam_xyz)
+        if meta.cam_xyz is None:
+            colour_source = "none"
+            say("note: no colour matrix for this camera; colours are white-balanced sensor RGB")
+        elif Path(recs[ref_i]["path"]).suffix.lower() == ".arw":
+            say("note: exiftool not found, so colour comes from LibRaw's tables, which can be wrong for new cameras")
     white_span = float(meta.white - black.mean())
-    linear = finish.to_linear_srgb(stack_cam, white_span, wb, meta.cam_xyz)
+    linear = finish.to_linear_srgb(stack_cam, white_span, wb, matrix)
 
     measured = finish.estimate_psf_sigma(finish.luminance(linear))
     if cfg.psf_sigma is not None:
@@ -293,7 +340,10 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         "psf_sigma_used": sigma,
         "white_balance": wb_used,
         "white_balance_multipliers": [float(v) for v in wb],
-        "has_colour_matrix": meta.cam_xyz is not None,
+        "colour_source": colour_source,
+        "channel_magnification": [float(v) for v in mag],
+        "channel_offset_px": b.tolist(),
+        "channel_residual_px": chroma_residual,
         "saturated_fraction": clipped,
         "flip": meta.flip,
         "seconds": round(time.time() - t_start, 1),

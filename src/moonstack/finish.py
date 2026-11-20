@@ -32,7 +32,7 @@ def disc_mask(Y: np.ndarray, frac: float = 0.03) -> np.ndarray:
     return Y > frac * float(np.percentile(Y, 99.5))
 
 
-def to_linear_srgb(stack, white_minus_black, wb, cam_xyz) -> np.ndarray:
+def to_linear_srgb(stack, white_minus_black, wb, matrix) -> np.ndarray:
     """Camera-RGB data numbers -> linear sRGB, 1.0 = sensor saturation in green."""
     x = stack / np.float32(white_minus_black)
     Y0 = x[..., 1]
@@ -40,7 +40,7 @@ def to_linear_srgb(stack, white_minus_black, wb, cam_xyz) -> np.ndarray:
     if sky.sum() > 1000:  # remove any residual black-level error per channel
         x = x - np.median(x[sky], axis=0).astype(np.float32)
     x = x * np.asarray(wb, dtype=np.float32)
-    return x @ camera_to_srgb(cam_xyz).T
+    return x @ np.asarray(matrix, dtype=np.float32).T
 
 
 def estimate_psf_sigma(Y: np.ndarray) -> float | None:
@@ -150,7 +150,7 @@ def render_natural(rgb: np.ndarray) -> np.ndarray:
     return srgb_encode(rgb * (0.85 / float(np.percentile(Y, 99.9)))).astype(np.float32)
 
 
-def render_mineral(rgb: np.ndarray, saturation: float = 6.0, chroma_blur: float = 2.0) -> np.ndarray:
+def render_mineral(rgb: np.ndarray, saturation: float = 12.0, chroma_blur: float = 2.0) -> np.ndarray:
     """Exaggerate the moon's faint colour differences.
 
     The disc is first balanced to neutral grey on average, so what remains is

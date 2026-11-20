@@ -68,7 +68,8 @@ def test_outlier_is_rejected(burst):
     f = sorted(folder.glob("synth_*.npz"))[5]
     z = dict(np.load(f))
     clean = z["bayer"].copy()
-    cfg = dict(quiet=True, keep=1.0, reference="synth_0000.npz")  # pinned: one shared geometry
+    # Pinned reference and no channel re-registration: one shared geometry.
+    cfg = dict(quiet=True, keep=1.0, reference="synth_0000.npz", chroma_align=False)
     try:
         z["bayer"][318:322, 330:470] = 16000  # short streak across the disc
         np.savez(f, **z)
@@ -80,3 +81,25 @@ def test_outlier_is_rejected(burst):
     base = run(folder, Config(**cfg)).stack_cam
     assert np.abs(without - base).max() > 300
     assert np.abs(with_rej - base).max() < 0.1 * np.abs(without - base).max()
+
+
+def test_colour_fringing_is_corrected(burst, tmp_path):
+    """Shift red and blue in every frame; the stack must come out registered."""
+    folder, _, _ = burst
+    out = tmp_path / "fringed"
+    out.mkdir()
+    for f in sorted(folder.glob("synth_*.npz")):
+        z = dict(np.load(f))
+        b = z["bayer"].astype(np.float32)
+        h, w = b.shape
+        for (ty, tx), (dx, dy) in {(0, 0): (0.6, -0.3), (1, 1): (-0.5, 0.4)}.items():  # R and B sites of RGGB
+            plane = b[ty::2, tx::2]
+            # A shift of d raw pixels is d/2 pixels of the half-resolution colour plane.
+            M = np.float32([[1, 0, dx / 2], [0, 1, dy / 2]])
+            b[ty::2, tx::2] = cv2.warpAffine(plane, M, (w // 2, h // 2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        z["bayer"] = np.clip(np.round(b), 0, 16383).astype(np.uint16)
+        np.savez(out / f.name, **z)
+    res = run(out, Config(quiet=True))
+    off = np.array(res.info["channel_offset_px"])
+    assert np.allclose(off[0], (0.6, -0.3), atol=0.15) and np.allclose(off[2], (-0.5, 0.4), atol=0.15)
+    assert res.info["channel_residual_px"] < 0.15

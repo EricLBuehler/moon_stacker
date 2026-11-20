@@ -24,7 +24,16 @@ Results go to `moonstack_out/` inside that folder (or `-o DIR`):
 4. **Stack** by Bayer drizzle: each raw red, green and blue sample is placed at its true aligned
    position, so no colour value is ever interpolated. Outliers are rejected against a noise model
    fitted to the data.
-5. **Finish**: measure the blur on the lunar limb, deconvolve brightness (Richardson-Lucy), render.
+5. **Register colours**: red and blue are shifted against green by the lens (by an amount that depends on
+   where the moon sits on the sensor) and by the atmosphere. Both are measured from the stack and corrected
+   per frame while stacking.
+6. **Finish**: measure the blur on the lunar limb, deconvolve brightness (Richardson-Lucy), render.
+
+## Colour
+
+For Sony ARW files the daylight white balance and colour matrix are read from the camera's own metadata
+via `exiftool` (`brew install exiftool`). Without it, colour falls back to LibRaw's tables, which were
+badly off for the a7R VI.
 
 ## Options worth knowing
 
@@ -32,8 +41,8 @@ Results go to `moonstack_out/` inside that folder (or `-o DIR`):
 - `--scale 1.5` output larger than the sensor grid; can recover detail if the lens out-resolves the sensor.
 - `--radius 0.75` stacking kernel width. Smaller is sharper but noisier.
 - `--sharpen-iters 25`, `--psf-sigma` deconvolution strength and blur override.
-- `--saturation 6` colour boost of the mineral image.
-- `--wb daylight|as-shot`, `--no-local`, `--kappa`, `--reference FILE`. See `--help`.
+- `--saturation 12` colour boost of the mineral image.
+- `--wb daylight|as-shot`, `--no-local`, `--no-chroma-align`, `--kappa`, `--reference FILE`. See `--help`.
 
 ## Testing
 

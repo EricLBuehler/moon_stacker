@@ -30,6 +30,7 @@ class RawFrame:
     wb_as_shot: np.ndarray | None  # (3,) multipliers, G = 1
     wb_daylight: np.ndarray | None  # (3,) multipliers, G = 1
     cam_xyz: np.ndarray | None  # (3, 3) XYZ(D65) -> camera RGB
+    cam_srgb: np.ndarray | None = None  # (3, 3) white-balanced camera RGB -> linear sRGB, from the camera itself
     flip: int = 0  # LibRaw orientation code (0, 3, 5, 6)
 
 
@@ -170,3 +171,32 @@ def ingest_one(path_str: str) -> dict:
         "meta": frame,
         **det,
     }
+
+
+def sony_colour(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """The camera's own daylight white balance and colour matrix from a Sony ARW.
+
+    Sony stores both in an encrypted metadata block that LibRaw does not expose,
+    so this asks exiftool (if installed). For bodies newer than LibRaw's colour
+    tables this is the only trustworthy source. Returns (wb, matrix) or None.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    exe = shutil.which("exiftool")
+    if exe is None or Path(path).suffix.lower() != ".arw":
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "-j", "-n", "-SR2SubIFD:WB_RGBLevelsDaylight", "-SR2SubIFD:ColorMatrix", str(path)],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout  # fmt: skip
+        tags = json.loads(out)[0]
+        wb = np.array([float(v) for v in str(tags["WB_RGBLevelsDaylight"]).split()])
+        m = np.array([float(v) for v in str(tags["ColorMatrix"]).split()]).reshape(3, 3)
+    except Exception:
+        return None
+    if wb.shape != (3,) or np.any(wb <= 0) or not np.allclose(m.sum(axis=1), m.sum(axis=1)[0], rtol=0.02):
+        return None
+    return (wb / wb[1]).astype(np.float32), (m / m.sum(axis=1, keepdims=True)).astype(np.float32)

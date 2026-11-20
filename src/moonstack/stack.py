@@ -21,6 +21,7 @@ def _accumulate(
     black,  # float32 (2, 2)
     gain,  # brightness normalisation for this frame
     M,  # float64 (2, 3) reference -> frame, full-res raw pixel coords
+    chan,  # float64 (3, 3) per colour: scale, x offset, y offset in frame coords
     field,  # float32 (gh, gw, 2) local (dx, dy) in full-res pixels
     f_off,
     f_step,
@@ -81,33 +82,37 @@ def _accumulate(
             py = ry + dy
             fx = M[0, 0] * px + M[0, 1] * py + M[0, 2]
             fy = M[1, 0] * px + M[1, 1] * py + M[1, 2]
-            x0 = int(np.floor(fx))
-            y0 = int(np.floor(fy))
-            for yy in range(y0, y0 + 2):
-                if yy < 0 or yy >= H:
-                    continue
-                ay = abs(yy - fy)
-                sy = 1.0 - ay * inv_r
-                if sy < 0.0:
-                    sy = 0.0
-                for xx in range(x0, x0 + 2):
-                    if xx < 0 or xx >= W:
+            for ch in range(3):
+                # Each colour is sampled at its own position: the lens and the
+                # atmosphere displace red and blue slightly relative to green.
+                qx = chan[ch, 0] * fx + chan[ch, 1]
+                qy = chan[ch, 0] * fy + chan[ch, 2]
+                x0 = int(np.floor(qx))
+                y0 = int(np.floor(qy))
+                for yy in range(y0, y0 + 2):
+                    if yy < 0 or yy >= H:
                         continue
-                    ax = abs(xx - fx)
-                    sx = 1.0 - ax * inv_r
-                    if sx < 0.0:
-                        sx = 0.0
-                    w = sx * sy + eps * (1.0 - ax) * (1.0 - ay)
-                    if w <= 0.0:
-                        continue
-                    c = cfa[yy & 1, xx & 1]
-                    val = (raw[yy, xx] - black[yy & 1, xx & 1]) * gain
-                    if use_rej and abs(val - mean[v, u, c]) > kappa * sigma[v, u, c]:
-                        rejected += 1
-                        continue
-                    ln[c] += w * val
-                    ld[c] += w
-                    sq[v, u, c] += w * val * val
+                    ay = abs(yy - qy)
+                    sy = 1.0 - ay * inv_r
+                    if sy < 0.0:
+                        sy = 0.0
+                    for xx in range(x0, x0 + 2):
+                        if xx < 0 or xx >= W or cfa[yy & 1, xx & 1] != ch:
+                            continue
+                        ax = abs(xx - qx)
+                        sx = 1.0 - ax * inv_r
+                        if sx < 0.0:
+                            sx = 0.0
+                        w = sx * sy + eps * (1.0 - ax) * (1.0 - ay)
+                        if w <= 0.0:
+                            continue
+                        val = (raw[yy, xx] - black[yy & 1, xx & 1]) * gain
+                        if use_rej and abs(val - mean[v, u, ch]) > kappa * sigma[v, u, ch]:
+                            rejected += 1
+                            continue
+                        ln[ch] += w * val
+                        ld[ch] += w
+                        sq[v, u, ch] += w * val * val
             for c in range(3):
                 if ld[c] > 0.0:
                     num[v, u, c] += ln[c]
@@ -121,6 +126,9 @@ def _accumulate(
                             vmin[v, u, c] = vf
                             wmin[v, u, c] = ld[c]
     return rejected
+
+
+_NO_SHIFT = np.array([[1.0, 0.0, 0.0]] * 3)
 
 
 class Stacker:
@@ -144,9 +152,12 @@ class Stacker:
         self.vmax, self.wmax, self.vmin, self.wmin = z(-np.inf), z(), z(np.inf), z()
         self.rejected = 0
 
-    def add(self, raw, gain, M, field, f_off, f_step, reject=False, kappa=3.0):
+    def add(self, raw, gain, M, field, f_off, f_step, reject=False, kappa=3.0, chan=None):
+        if chan is None:
+            chan = _NO_SHIFT
         self.rejected += _accumulate(
             raw, self.cfa, self.black, np.float32(gain), np.ascontiguousarray(M, dtype=np.float64),
+            np.ascontiguousarray(chan, dtype=np.float64),
             np.ascontiguousarray(field, dtype=np.float32), float(f_off), float(f_step),
             self.scale, self.radius, self.num, self.den, self.sq,
             self.vmax, self.wmax, self.vmin, self.wmin,
@@ -226,3 +237,34 @@ def _trimmed_mean(x: np.ndarray) -> float:
     if x.size == 0:
         return 0.0
     return float(x[x <= np.percentile(x, 99)].mean())
+
+
+def measure_channel_shift(stack: np.ndarray, scale: float) -> np.ndarray | None:
+    """How red and blue are displaced relative to green in a stack.
+
+    Returns (3, 3): per colour, magnification and (x, y) offset such that the
+    detail green shows at raw position p appears at ``mag * p + offset`` in
+    that colour. None if the measurement fails or looks implausible.
+    """
+    g = stack[..., 1]
+    top = float(np.percentile(g, 99.5))
+    if top <= 0:
+        return None
+    a = (g / top).astype(np.float32)
+    out = np.array([[1.0, 0.0, 0.0]] * 3)
+    crit = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 300, 1e-9)
+    for ch in (0, 2):
+        b = (stack[..., ch] / (float(np.percentile(stack[..., ch], 99.5)) + 1e-9)).astype(np.float32)
+        W = np.eye(2, 3, dtype=np.float32)
+        try:
+            _, W = cv2.findTransformECC(a, b, W, cv2.MOTION_TRANSLATION, crit, None, 5)
+            _, W = cv2.findTransformECC(a, b, W, cv2.MOTION_AFFINE, crit, None, 5)
+        except cv2.error:
+            return None
+        mag = 0.5 * float(W[0, 0] + W[1, 1])
+        # Output-pixel coordinates -> raw-pixel coordinates.
+        t = (mag * (0.5 * scale - 0.5) + W[:, 2].astype(np.float64) + 0.5) / scale - 0.5
+        if abs(mag - 1) > 0.003 or np.abs(t).max() > 0.003 * max(g.shape) / scale + 4:
+            return None
+        out[ch] = (mag, t[0], t[1])
+    return out

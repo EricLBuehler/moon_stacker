@@ -24,11 +24,12 @@ def main(argv=None) -> int:
                     help="outlier rejection threshold in sigmas; 0 disables (default 3)")  # fmt: skip
     ap.add_argument("--reference", help="file name of the frame to align to (default: the sharpest)")
     ap.add_argument("--no-local", action="store_true", help="skip the local turbulence correction")
+    ap.add_argument("--no-chroma-align", action="store_true", help="do not register red and blue to green")
     ap.add_argument("--wb", choices=["daylight", "as-shot"], default="daylight",
                     help="white balance (default daylight: the moon is sunlit rock)")  # fmt: skip
     ap.add_argument("--psf-sigma", type=float, help="blur to remove, in output pixels (default: measured on the limb)")
     ap.add_argument("--sharpen-iters", type=int, default=25, help="deconvolution iterations; 0 disables (default 25)")
-    ap.add_argument("--saturation", type=float, default=6.0, help="colour boost of the mineral image (default 6)")
+    ap.add_argument("--saturation", type=float, default=12.0, help="colour boost of the mineral image (default 12)")
     ap.add_argument("-j", "--jobs", type=int, default=0, help="worker count (default: all cores)")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
@@ -41,7 +42,7 @@ def main(argv=None) -> int:
     from .pipeline import Config, run, write_outputs
 
     cfg = Config(
-        keep=a.keep, scale=a.scale, radius=a.radius, kappa=a.kappa, local=not a.no_local, wb=a.wb,
+        keep=a.keep, scale=a.scale, radius=a.radius, kappa=a.kappa, local=not a.no_local, chroma_align=not a.no_chroma_align, wb=a.wb,
         psf_sigma=a.psf_sigma, reference=a.reference, sharpen_iters=a.sharpen_iters, saturation=a.saturation, jobs=a.jobs, quiet=a.quiet,
     )  # fmt: skip
     try:
