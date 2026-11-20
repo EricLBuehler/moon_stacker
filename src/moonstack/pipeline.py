@@ -198,7 +198,7 @@ def run(folder: Path, cfg: Config) -> Result:
         raise RuntimeError(f"no RAW files found in {folder}")
     say(f"{len(paths)} files in {folder}")
 
-    frames, tmp_path, recs, dropped, meta = _ingest(paths, min(jobs, 12), log)
+    frames, tmp_path, recs, dropped, meta = _ingest(paths, min(jobs, 16), log)
     try:
         return _process(frames, recs, dropped, meta, cfg, say, jobs, t_start)
     finally:

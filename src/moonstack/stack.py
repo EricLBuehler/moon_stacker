@@ -252,7 +252,8 @@ def measure_channel_shift(stack: np.ndarray, scale: float) -> np.ndarray | None:
         return None
     a = (g / top).astype(np.float32)
     out = np.array([[1.0, 0.0, 0.0]] * 3)
-    crit = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 300, 1e-9)
+    # Converges long before 100 iterations; a tighter tolerance only burns time.
+    crit = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 100, 1e-7)
     for ch in (0, 2):
         b = (stack[..., ch] / (float(np.percentile(stack[..., ch], 99.5)) + 1e-9)).astype(np.float32)
         W = np.eye(2, 3, dtype=np.float32)
