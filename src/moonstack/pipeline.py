@@ -272,7 +272,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
 
     # 3. Local (turbulence) field against the mean of the best frames, which
     #    has the per-frame distortions averaged out.
-    fields = [np.zeros((1, 1, 2), np.float32)] * n
+    fields = np.zeros((n, 1, 1, 2), np.float32)  # per frame: local (dx, dy) on the aligner's node grid
     f_off, f_step = 0.0, 1e12
     local_conf = np.full(n, np.nan)
     if cfg.local:
@@ -294,24 +294,48 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
             kept_set = set(kept)
             for i, res in enumerate(progress(threads.map(do_local, range(n)), "local")):
                 if res is not None:
+                    if fields.shape[1:] != res[0].shape:
+                        fields = np.zeros((n, *res[0].shape), np.float32)
                     fields[i] = 2.0 * res[0]  # half-res pixels -> full-res pixels
                     local_conf[i] = res[1]
         else:
             say("moon too small for local alignment; using global alignment only")
     threads.shutdown()
 
-    # 4. Bayer drizzle in three passes: the first gives the mean and scatter that
-    #    the following passes use to throw out outliers.
-    from .stack import Stacker, measure_channel_shift  # imported late: numba start-up is slow
+    # 4. Bayer drizzle. A first stack at sensor resolution measures what the
+    #    real one needs to know; then come the plain pass and the two passes
+    #    that use its mean and scatter to throw out outliers.
+    from .stack import BATCH, Stacker, measure_channel_shift  # imported late: numba start-up is slow
 
-    full = [align.half_to_full(w) for w in warps]
+    full = np.array([align.half_to_full(w) for w in warps])
+
+    # Red and blue land slightly displaced from green: the lens magnifies each
+    # colour differently (so the displacement depends on where the moon sits on
+    # the sensor, which changes through the burst) and the atmosphere adds a
+    # constant offset. Model both per colour, in sensor coordinates, as
+    #     position_in_colour = mag * position_in_green + b
+    origins = np.array([r["canvas_origin"] for r in recs], dtype=np.float64)
+    mag, b = np.ones(3), np.zeros((3, 2))
+
+    def one_pass(stacker, desc, reject=False):
+        chans = np.array([np.column_stack([mag, (mag - 1)[:, None] * o + b]) for o in origins])
+        with tqdm(total=len(kept), desc=desc, disable=cfg.quiet, unit="frame") as bar:
+            for s in range(0, len(kept), BATCH):
+                batch = kept[s : s + BATCH]
+                stacker.add(frames, batch, gains, full, fields, f_off, f_step, reject, cfg.kappa, chans)
+                bar.update(len(batch))
+
+    def channel_error(m):
+        """Largest displacement anywhere in the working area, in sensor pixels."""
+        return float(np.abs(m[:, 1:]).max() + np.abs(m[:, 0] - 1).max() * max(ch, cw) / 2)
+
+    stacker = Stacker((ch, cw), meta.cfa, black, 1.0, cfg.radius)
+    one_pass(stacker, "measure")
+    measured = stacker.result()
+
     scale_note = None
     if cfg.scale == "auto":
-        # A quick sensor-resolution stack tells us how blurred the data is.
-        probe = Stacker((ch, cw), meta.cfa, black, 1.0, cfg.radius)
-        for i in tqdm(kept, desc="probe", disable=cfg.quiet, unit="frame"):
-            probe.add(frames[i], gains[i], full[i], fields[i], f_off, f_step)
-        probe_sigma = finish.estimate_psf_sigma(probe.result()[..., 1])
+        probe_sigma = finish.estimate_psf_sigma(measured[..., 1])
         chosen = choose_scale(probe_sigma, cfg.sharpen_iters > 0)
         scale_note = {"requested": "auto", "blur_sigma_at_sensor_scale": probe_sigma}
         if probe_sigma is None:
@@ -322,53 +346,41 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
             say(f"auto scale: blur is {probe_sigma:.2f} px; stacking at {chosen:g}x so the sharpened image has "
                 f"enough pixels to render smoothly")  # fmt: skip
         cfg = replace(cfg, scale=chosen)
-        del probe
-    stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)
+    reusable = cfg.scale == 1.0  # the measuring stack doubles as the first pass if nothing changes
 
-    # Red and blue land slightly displaced from green: the lens magnifies each
-    # colour differently (so the displacement depends on where the moon sits on
-    # the sensor, which changes through the burst) and the atmosphere adds a
-    # constant offset. Model both per colour, in sensor coordinates, as
-    #     position_in_colour = mag * position_in_green + b
-    origins = np.array([r["canvas_origin"] for r in recs], dtype=np.float64)
-    mag, b = np.ones(3), np.zeros((3, 2))
-
-    def chan_for(i):
-        return np.column_stack([mag, (mag - 1)[:, None] * origins[i] + b])
-
-    def one_pass(desc, reject):
-        for i in tqdm(kept, desc=desc, disable=cfg.quiet, unit="frame"):
-            stacker.add(frames[i], gains[i], full[i], fields[i], f_off, f_step, reject, cfg.kappa, chan_for(i))
-
-    one_pass("stack", False)
     chroma_residual = None
+    corrected = False
     if cfg.chroma_align:
-        # Where the reference area's origin falls on the sensor, averaged over the burst.
-        t_bar = np.mean([full[i][:, 2] + origins[i] for i in kept], axis=0)
-        for round_ in range(2):
-            m = measure_channel_shift(stacker.result(), cfg.scale)
-            if m is None:
-                if round_ == 0:
-                    say("could not measure colour-channel alignment; leaving channels as they are")
-                break
-            # Largest displacement anywhere in the working area, in pixels.
-            chroma_residual = float(np.abs(m[:, 1:]).max() + np.abs(m[:, 0] - 1).max() * max(ch, cw) / 2)
+        m = measure_channel_shift(measured, 1.0)
+        if m is None:
+            say("could not measure colour-channel alignment; leaving channels as they are")
+        else:
+            chroma_residual = channel_error(m)
             # Small, noisy stacks can show ~0.1 px of spurious shift; real lens and
             # atmosphere effects worth correcting are larger.
-            if round_ == 1 or chroma_residual < 0.2:
-                break
-            # m describes the uncorrected stack; turn it into the sensor model.
-            b = b + m[:, 1:] - (m[:, 0] - 1)[:, None] * t_bar
-            mag = mag * m[:, 0]
-            say(f"colour channels vs green: red {np.hypot(*m[0, 1:]):.2f} px, blue {np.hypot(*m[2, 1:]):.2f} px; correcting")
-            stacker.reset()
-            one_pass("restack", False)
+            if chroma_residual >= 0.2:
+                # Where the reference area's origin falls on the sensor, averaged over the burst.
+                t_bar = np.mean([full[i][:, 2] + origins[i] for i in kept], axis=0)
+                # m describes the uncorrected stack; turn it into the sensor model.
+                b = m[:, 1:] - (m[:, 0] - 1)[:, None] * t_bar
+                mag = m[:, 0].copy()
+                say(f"colour channels vs green: red {np.hypot(*m[0, 1:]):.2f} px, blue {np.hypot(*m[2, 1:]):.2f} px; correcting")
+                corrected = True
+                reusable = False
+    del measured
+
+    if not reusable:
+        stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)
+        one_pass(stacker, "stack")
     if cfg.kappa > 0:
         stacker.finish_first_pass()
-        one_pass("reject", True)
+        one_pass(stacker, "reject", True)
         stacker.refine()
-        one_pass("refine", True)
+        one_pass(stacker, "refine", True)
     stack_cam = stacker.result()
+    if corrected:
+        m = measure_channel_shift(stack_cam, cfg.scale)
+        chroma_residual = None if m is None else channel_error(m)
     rej_frac = stacker.rejected / max(1.0, 4.0 * len(kept) * stack_cam.shape[0] * stack_cam.shape[1])
 
     # 5. Colour and sharpening.

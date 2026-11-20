@@ -16,13 +16,14 @@ from numba import njit, prange
 
 @njit(parallel=True, fastmath=True, cache=True, nogil=True)
 def _accumulate(
-    raw,  # uint16 (H, W)
+    frames,  # uint16 (N, H, W): every frame's raw mosaic
+    idx,  # int64 (K,): which frames to add, in order
     cfa,  # int64 (2, 2)
     black,  # float32 (2, 2)
-    gain,  # brightness normalisation for this frame
-    M,  # float64 (2, 3) reference -> frame, full-res raw pixel coords
-    chan,  # float64 (3, 3) per colour: scale, x offset, y offset in frame coords
-    field,  # float32 (gh, gw, 2) local (dx, dy) in full-res pixels
+    gains,  # float32 (N,) brightness normalisation per frame
+    Ms,  # float64 (N, 2, 3) reference -> frame, full-res raw pixel coords
+    chans,  # float64 (N, 3, 3) per colour: scale, x offset, y offset in frame coords
+    fields,  # float32 (N, gh, gw, 2) local (dx, dy) in full-res pixels
     f_off,
     f_step,
     scale,  # output pixels per raw pixel
@@ -39,15 +40,18 @@ def _accumulate(
     sigma,
     kappa,
 ):
-    H, W = raw.shape
+    H, W = frames.shape[1], frames.shape[2]
     Ho, Wo = num.shape[0], num.shape[1]
-    gh, gw = field.shape[0], field.shape[1]
+    gh, gw = fields.shape[1], fields.shape[2]
     inv_s = 1.0 / scale
     inv_r = 1.0 / radius
     # A faint full-width kernel guarantees coverage where the sharp kernel
     # happens to find no sample of some colour.
     eps = 1e-3
     rejected = 0
+    # Rows outside, frames inside: one output row's running totals stay in the
+    # CPU cache while all the frames are added to it. The other way round,
+    # every frame drags the whole set of totals through memory.
     for v in prange(Ho):
         ry = (v + 0.5) * inv_s - 0.5
         gy = (ry - f_off) / f_step
@@ -58,74 +62,90 @@ def _accumulate(
         iy0 = int(gy)
         iy1 = min(iy0 + 1, gh - 1)
         ty = gy - iy0
-        ln = np.zeros(3, np.float32)  # this frame's contribution to one pixel
+        ln = np.zeros(3, np.float32)  # one frame's contribution to one pixel
         ld = np.zeros(3, np.float32)
-        for u in range(Wo):
-            ln[:] = 0.0
-            ld[:] = 0.0
-            rx = (u + 0.5) * inv_s - 0.5
-            gx = (rx - f_off) / f_step
-            if gx < 0.0:
-                gx = 0.0
-            elif gx > gw - 1:
-                gx = gw - 1.0
-            ix0 = int(gx)
-            ix1 = min(ix0 + 1, gw - 1)
-            tx = gx - ix0
-            w00 = (1 - tx) * (1 - ty)
-            w01 = tx * (1 - ty)
-            w10 = (1 - tx) * ty
-            w11 = tx * ty
-            dx = w00 * field[iy0, ix0, 0] + w01 * field[iy0, ix1, 0] + w10 * field[iy1, ix0, 0] + w11 * field[iy1, ix1, 0]
-            dy = w00 * field[iy0, ix0, 1] + w01 * field[iy0, ix1, 1] + w10 * field[iy1, ix0, 1] + w11 * field[iy1, ix1, 1]
-            px = rx + dx
-            py = ry + dy
-            fx = M[0, 0] * px + M[0, 1] * py + M[0, 2]
-            fy = M[1, 0] * px + M[1, 1] * py + M[1, 2]
-            for ch in range(3):
-                # Each colour is sampled at its own position: the lens and the
-                # atmosphere displace red and blue slightly relative to green.
-                qx = chan[ch, 0] * fx + chan[ch, 1]
-                qy = chan[ch, 0] * fy + chan[ch, 2]
-                x0 = int(np.floor(qx))
-                y0 = int(np.floor(qy))
-                for yy in range(y0, y0 + 2):
-                    if yy < 0 or yy >= H:
+        lq = np.zeros(3, np.float32)
+        for k in range(idx.shape[0]):
+            f = idx[k]
+            raw = frames[f]
+            field = fields[f]
+            M = Ms[f]
+            chan = chans[f]
+            gain = gains[f]
+            for u in range(Wo):
+                for c in range(3):
+                    ln[c] = 0.0
+                    ld[c] = 0.0
+                    lq[c] = 0.0
+                rx = (u + 0.5) * inv_s - 0.5
+                gx = (rx - f_off) / f_step
+                if gx < 0.0:
+                    gx = 0.0
+                elif gx > gw - 1:
+                    gx = gw - 1.0
+                ix0 = int(gx)
+                ix1 = min(ix0 + 1, gw - 1)
+                tx = gx - ix0
+                w00 = (1 - tx) * (1 - ty)
+                w01 = tx * (1 - ty)
+                w10 = (1 - tx) * ty
+                w11 = tx * ty
+                dx = w00 * field[iy0, ix0, 0] + w01 * field[iy0, ix1, 0] + w10 * field[iy1, ix0, 0] + w11 * field[iy1, ix1, 0]
+                dy = w00 * field[iy0, ix0, 1] + w01 * field[iy0, ix1, 1] + w10 * field[iy1, ix0, 1] + w11 * field[iy1, ix1, 1]
+                px = rx + dx
+                py = ry + dy
+                fx = M[0, 0] * px + M[0, 1] * py + M[0, 2]
+                fy = M[1, 0] * px + M[1, 1] * py + M[1, 2]
+                # The 2x2 block of raw samples around a position holds exactly
+                # one sample from each site of the colour pattern, so go
+                # straight to it instead of testing all four for every colour.
+                for site in range(4):
+                    sy_par = site >> 1
+                    sx_par = site & 1
+                    ch = cfa[sy_par, sx_par]
+                    # Each colour is sampled at its own position: the lens and the
+                    # atmosphere displace red and blue slightly relative to green.
+                    qx = chan[ch, 0] * fx + chan[ch, 1]
+                    qy = chan[ch, 0] * fy + chan[ch, 2]
+                    x0 = int(np.floor(qx))
+                    y0 = int(np.floor(qy))
+                    xx = x0 + ((x0 ^ sx_par) & 1)
+                    yy = y0 + ((y0 ^ sy_par) & 1)
+                    if xx < 0 or xx >= W or yy < 0 or yy >= H:
                         continue
+                    ax = abs(xx - qx)
                     ay = abs(yy - qy)
-                    sy = 1.0 - ay * inv_r
-                    if sy < 0.0:
-                        sy = 0.0
-                    for xx in range(x0, x0 + 2):
-                        if xx < 0 or xx >= W or cfa[yy & 1, xx & 1] != ch:
-                            continue
-                        ax = abs(xx - qx)
-                        sx = 1.0 - ax * inv_r
-                        if sx < 0.0:
-                            sx = 0.0
-                        w = sx * sy + eps * (1.0 - ax) * (1.0 - ay)
-                        if w <= 0.0:
-                            continue
-                        val = (raw[yy, xx] - black[yy & 1, xx & 1]) * gain
-                        if use_rej and abs(val - mean[v, u, ch]) > kappa * sigma[v, u, ch]:
-                            rejected += 1
-                            continue
-                        ln[ch] += w * val
-                        ld[ch] += w
-                        sq[v, u, ch] += w * val * val
-            for c in range(3):
-                if ld[c] > 0.0:
-                    num[v, u, c] += ln[c]
-                    den[v, u, c] += ld[c]
-                    if not use_rej:
-                        vf = ln[c] / ld[c]
-                        if vf > vmax[v, u, c]:
-                            vmax[v, u, c] = vf
-                            wmax[v, u, c] = ld[c]
-                        if vf < vmin[v, u, c]:
-                            vmin[v, u, c] = vf
-                            wmin[v, u, c] = ld[c]
+                    sx = max(1.0 - ax * inv_r, 0.0)
+                    sy = max(1.0 - ay * inv_r, 0.0)
+                    w = sx * sy + eps * (1.0 - ax) * (1.0 - ay)
+                    if w <= 0.0:
+                        continue
+                    val = (raw[yy, xx] - black[sy_par, sx_par]) * gain
+                    if use_rej and abs(val - mean[v, u, ch]) > kappa * sigma[v, u, ch]:
+                        rejected += 1
+                        continue
+                    ln[ch] += w * val
+                    ld[ch] += w
+                    lq[ch] += w * val * val
+                for c in range(3):
+                    if ld[c] > 0.0:
+                        num[v, u, c] += ln[c]
+                        den[v, u, c] += ld[c]
+                        sq[v, u, c] += lq[c]
+                        if not use_rej:
+                            vf = ln[c] / ld[c]
+                            if vf > vmax[v, u, c]:
+                                vmax[v, u, c] = vf
+                                wmax[v, u, c] = ld[c]
+                            if vf < vmin[v, u, c]:
+                                vmin[v, u, c] = vf
+                                wmin[v, u, c] = ld[c]
     return rejected
+
+
+# Frames per call of the kernel: enough to keep each row's totals in cache for
+# many frames, few enough that a progress bar still moves.
+BATCH = 16
 
 
 _NO_SHIFT = np.array([[1.0, 0.0, 0.0]] * 3)
@@ -152,13 +172,16 @@ class Stacker:
         self.vmax, self.wmax, self.vmin, self.wmin = z(-np.inf), z(), z(np.inf), z()
         self.rejected = 0
 
-    def add(self, raw, gain, M, field, f_off, f_step, reject=False, kappa=3.0, chan=None):
-        if chan is None:
-            chan = _NO_SHIFT
+    def add(self, frames, idx, gains, Ms, fields, f_off, f_step, reject=False, kappa=3.0, chans=None):
+        """Add frames[i] for each i in idx. All per-frame arrays are indexed like `frames`."""
+        n = len(frames)
+        if chans is None:
+            chans = np.broadcast_to(_NO_SHIFT, (n, 3, 3))
         self.rejected += _accumulate(
-            raw, self.cfa, self.black, np.float32(gain), np.ascontiguousarray(M, dtype=np.float64),
-            np.ascontiguousarray(chan, dtype=np.float64),
-            np.ascontiguousarray(field, dtype=np.float32), float(f_off), float(f_step),
+            frames, np.asarray(idx, dtype=np.int64), self.cfa, self.black,
+            np.ascontiguousarray(gains, dtype=np.float32), np.ascontiguousarray(Ms, dtype=np.float64),
+            np.ascontiguousarray(chans, dtype=np.float64),
+            np.ascontiguousarray(fields, dtype=np.float32), float(f_off), float(f_step),
             self.scale, self.radius, self.num, self.den, self.sq,
             self.vmax, self.wmax, self.vmin, self.wmin,
             reject, self.mean, self.sigma, np.float32(kappa),
