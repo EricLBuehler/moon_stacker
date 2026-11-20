@@ -65,6 +65,8 @@ def test_stack_matches_truth(burst, tmp_path):
     again = rerender(tmp_path / "out", cfg)
     assert np.allclose(again.sharp, res.sharp, rtol=1e-4, atol=1e-6)
     assert again.frames == res.frames
+    paired = write_outputs(again, tmp_path / "pair", Config(quiet=True, pair=True), save_stack=False)
+    assert paired["moon_pair.jpg"].stat().st_size > 0 and "moon_pair.jpg" not in files
     softer = rerender(tmp_path / "out", Config(quiet=True, sharpen_iters=0))
     assert _error(softer.sharp, truth) > e_sharp
     assert softer.info["config"]["sharpen_iters"] == 0

@@ -55,6 +55,7 @@ badly off for the a7R VI.
 
 ## Options worth knowing
 
+- `--pair` also writes `moon_pair.jpg`: natural and mineral side by side, cropped to the moon. Works with `--rerender`.
 - `--keep 0.8` fraction of frames stacked. Lower is sharper, higher is cleaner.
 - `--local-keep 0.5` regional frame selection (off by default). Turbulence blurs different parts of the moon in
   different frames, so each small region is stacked from the frames that were sharpest *there*, blended

@@ -310,6 +310,18 @@ def colour_trust(Y: np.ndarray, top: float, saturation: float, chroma_blur: floa
     return cv2.GaussianBlur(trust.astype(np.float32), (0, 0), chroma_blur)
 
 
+def side_by_side(left: np.ndarray, right: np.ndarray, margin: float = 0.07) -> np.ndarray:
+    """Two renders of the same stack next to each other on black, cropped to the moon."""
+    ys, xs = np.nonzero(disc_mask(luminance(left), 0.05))
+    if len(xs) == 0:
+        return np.hstack([left, right])
+    h, w = left.shape[:2]
+    pad = int(margin * max(xs.max() - xs.min(), ys.max() - ys.min()))
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, h)
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, w)
+    return np.hstack([left[y0:y1, x0:x1], right[y0:y1, x0:x1]])
+
+
 def apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
     """Apply the camera orientation tag (LibRaw codes)."""
     if flip == 3:

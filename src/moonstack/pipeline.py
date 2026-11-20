@@ -33,6 +33,7 @@ class Config:
     sharpen_iters: int = 25
     saturation: float = 12.0
     flatten_colour: bool = True  # remove the smooth colour slope across the disc in the mineral image
+    pair: bool = False  # also write natural and mineral side by side as one picture
     local_keep: float | None = None  # within each region, stack only its sharpest fraction of frames
     partial_decode: bool = True  # decode only the tiles around the moon when the format allows
     jobs: int = 0  # 0 = all cores
@@ -52,7 +53,7 @@ class Result:
 
 STACK_FILE = "moon_stack.npz"
 # Options that only affect develop(); a re-render may change these.
-FINISH_OPTIONS = ("wb", "psf_sigma", "sharpen_iters", "saturation", "flatten_colour")
+FINISH_OPTIONS = ("wb", "psf_sigma", "sharpen_iters", "saturation", "flatten_colour", "pair")
 
 
 def develop(stack_cam: np.ndarray, colour: dict, cfg: Config, say=lambda *_a, **_k: None):
@@ -532,6 +533,8 @@ def write_outputs(res: Result, out: Path, cfg: Config, save_stack: bool = True) 
     tiff("moon_mineral.tif", u16(mineral), iccprofile=icc)
     jpeg("moon_natural.jpg", natural)
     jpeg("moon_mineral.jpg", mineral)
+    if cfg.pair:
+        jpeg("moon_pair.jpg", finish.side_by_side(natural, mineral))
     p = out / "report.json"
     p.write_text(json.dumps({"summary": res.info, "frames": res.frames}, indent=2))
     files["report.json"] = p
