@@ -150,18 +150,58 @@ def render_natural(rgb: np.ndarray) -> np.ndarray:
     return srgb_encode(rgb * (0.85 / float(np.percentile(Y, 99.9)))).astype(np.float32)
 
 
-def render_mineral(rgb: np.ndarray, saturation: float = 12.0, chroma_blur: float = 2.0) -> np.ndarray:
+def colour_tilt(rgb: np.ndarray, lit: np.ndarray) -> np.ndarray:
+    """Smooth colour slope across the disc, as a per-pixel gain (H, W, 3).
+
+    The atmosphere reddens the lower edge of the moon slightly more than the
+    upper edge, leaving a colour ramp across the disc of around a percent. That
+    is invisible normally but larger than the moon's real colour differences,
+    so a strong saturation boost turns it into "orange on one side, blue on the
+    other". We fit a plane to each channel's colour ratio over the bright
+    highlands (the most uniformly coloured terrain) and return it.
+    """
+    Y = luminance(rgb)
+    b = cv2.GaussianBlur(rgb, (0, 0), 4.0)
+    Yb = np.maximum(cv2.GaussianBlur(Y, (0, 0), 4.0), 1e-12)
+    inner = cv2.erode(lit.astype(np.uint8), np.ones((41, 41), np.uint8)).astype(bool)
+    h, w = Y.shape
+    gain = np.ones((h, w, 3), np.float32)
+    if inner.sum() < 5000:
+        return gain
+    sel = inner & (Yb > np.median(Yb[inner]))
+    ys, xs = np.nonzero(sel)
+    ys, xs = ys[::7], xs[::7]
+    cx, cy = xs.mean(), ys.mean()
+    A = np.stack([xs - cx, ys - cy, np.ones(len(xs))], axis=1).astype(np.float64)
+    yy, xx = np.mgrid[:h, :w].astype(np.float32)
+    for c in range(3):
+        v = np.log(np.maximum(b[ys, xs, c], 1e-12) / Yb[ys, xs]).astype(np.float64)
+        wgt = np.ones(len(v))
+        for _ in range(8):  # robust fit: craters and rays must not steer the plane
+            coef = np.linalg.lstsq(A * wgt[:, None], v * wgt, rcond=None)[0]
+            r = v - A @ coef
+            scale = 1.4826 * np.median(np.abs(r)) + 1e-12
+            wgt = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(r), 1e-12))
+        gain[..., c] = np.exp(coef[0] * (xx - cx) + coef[1] * (yy - cy))
+    return gain
+
+
+def render_mineral(rgb: np.ndarray, saturation: float = 12.0, chroma_blur: float = 2.0, flatten: bool = True) -> np.ndarray:
     """Exaggerate the moon's faint colour differences.
 
-    The disc is first balanced to neutral grey on average, so what remains is
-    how each region differs from the mean. That difference is smoothed slightly
-    (the colour regions are broad; noise is not) and multiplied up.
+    The disc is first balanced to neutral grey on average (and, with `flatten`,
+    any smooth colour slope across it is removed), so what remains is how each
+    region differs from the mean. That difference is smoothed slightly (the
+    colour regions are broad; noise is not) and multiplied up.
     """
     Y = luminance(rgb)
     top = float(np.percentile(Y, 99.9))
     lit = Y > 0.25 * top
     if lit.sum() < 100:
         return render_natural(rgb)
+    if flatten:
+        rgb = rgb / colour_tilt(rgb, lit)
+        Y = luminance(rgb)
     balanced = rgb / (np.median(rgb[lit], axis=0) / np.median(Y[lit])).astype(np.float32)
     Y = luminance(balanced)
     Ysafe = np.maximum(Y, 1e-6 * top)

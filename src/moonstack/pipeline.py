@@ -31,6 +31,7 @@ class Config:
     reference: str | None = None  # file name to align everything to (default: sharpest)
     sharpen_iters: int = 25
     saturation: float = 12.0
+    flatten_colour: bool = True  # remove the smooth colour slope across the disc in the mineral image
     jobs: int = 0  # 0 = all cores
     quiet: bool = False
 
@@ -383,7 +384,7 @@ def write_outputs(res: Result, out: Path, cfg: Config, flip: int = 0) -> dict[st
     f = lambda a: finish.apply_flip(a, flip)  # noqa: E731
     tiff("moon_linear.tif", f(res.linear).astype(np.float32))
     natural = f(finish.render_natural(res.sharp))
-    mineral = f(finish.render_mineral(res.sharp, cfg.saturation, 2.0 * cfg.scale))
+    mineral = f(finish.render_mineral(res.sharp, cfg.saturation, 2.0 * cfg.scale, cfg.flatten_colour))
     tiff("moon_natural.tif", u16(natural), iccprofile=icc)
     tiff("moon_mineral.tif", u16(mineral), iccprofile=icc)
     jpeg("moon_natural.jpg", natural)
