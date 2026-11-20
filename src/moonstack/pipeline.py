@@ -7,7 +7,7 @@ import os
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -21,7 +21,7 @@ from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one, sony_colour
 @dataclass
 class Config:
     keep: float = 0.8  # fraction of frames to stack, sharpest first
-    scale: float = 1.0  # output pixels per sensor pixel
+    scale: float | str = 1.0  # output pixels per sensor pixel, or "auto" to choose from the measured blur
     radius: float = 0.75  # drizzle kernel half-width in sensor pixels
     kappa: float = 3.0  # outlier rejection threshold in sigmas (0 = off)
     local: bool = True  # correct turbulence warping with a local field
@@ -44,6 +44,75 @@ class Result:
     psf_sigma: float
     frames: list[dict] = field(default_factory=list)  # per-frame report
     info: dict = field(default_factory=dict)
+    colour: dict = field(default_factory=dict)  # what develop() needs besides the stack
+
+
+STACK_FILE = "moon_stack.npz"
+# Options that only affect develop(); a re-render may change these.
+FINISH_OPTIONS = ("wb", "psf_sigma", "sharpen_iters", "saturation", "flatten_colour")
+
+
+def develop(stack_cam: np.ndarray, colour: dict, cfg: Config, say=lambda *_a, **_k: None):
+    """Stack -> linear image -> sharpened image. Everything after stacking.
+
+    Returns (linear, sharp, info). Cheap enough to repeat with new settings.
+    """
+    scale = float(colour["scale"])
+    daylight, as_shot = colour.get("wb_daylight"), colour.get("wb_as_shot")
+    wb, wb_used = (daylight, "daylight") if cfg.wb == "daylight" else (as_shot, "as-shot")
+    if wb is None:
+        wb, wb_used = (as_shot, "as-shot") if as_shot is not None else ([1.0, 1.0, 1.0], "none")
+    linear = finish.to_linear_srgb(stack_cam, colour["white_span"], wb, colour["matrix"])
+
+    measured = finish.estimate_psf_sigma(finish.luminance(linear))
+    if cfg.psf_sigma is not None:
+        sigma = cfg.psf_sigma
+    elif measured is not None:
+        sigma = float(np.clip(0.9 * measured, 0.5 * scale, 3.0 * scale))
+    else:
+        sigma = 1.0 * scale
+        say("could not measure blur on the limb; assuming a typical value")
+    sharp = finish.sharpen(linear, sigma, cfg.sharpen_iters)
+    info = {
+        "psf_sigma_measured": measured,
+        "psf_sigma_used": sigma,
+        "white_balance": wb_used,
+        "white_balance_multipliers": [float(v) for v in wb],
+    }
+    return linear, sharp, info
+
+
+def rerender(out: Path, cfg: Config) -> Result:
+    """Redo colour, sharpening and rendering from a saved stack (seconds, not a full run)."""
+    path = Path(out) / STACK_FILE
+    if not path.exists():
+        raise RuntimeError(f"no saved stack at {path}; run moonstack on the RAW folder once first")
+    z = np.load(path)
+    saved = json.loads(str(z["meta"]))
+    colour = saved["colour"]
+    stack_cam = z["stack_cam"]
+    say = (lambda *_a, **_k: None) if cfg.quiet else print
+    linear, sharp, dev = develop(stack_cam, colour, cfg, say)
+    info = {**saved["summary"], **dev}
+    info["config"] = {**info.get("config", {}), **{k: getattr(cfg, k) for k in FINISH_OPTIONS}}
+    return Result(stack_cam, linear, sharp, dev["psf_sigma_used"], saved["frames"], info, colour)
+
+
+# Blur (Gaussian sigma, in output pixels) at which detail is comfortably
+# sampled: finer than this and the pixel grid, not the optics, limits detail.
+_WELL_SAMPLED_SIGMA = 1.2
+
+
+def choose_scale(sigma: float | None) -> float:
+    """Output scale for --scale auto, from the blur measured at sensor scale.
+
+    Enlarges only when the image is sharper than the sensor grid can show,
+    just enough to bring the blur up to a well-sampled size. Steps of 0.25,
+    at most 2x.
+    """
+    if sigma is None or sigma <= 0:
+        return 1.0
+    return float(np.clip(np.round(_WELL_SAMPLED_SIGMA / sigma * 4) / 4, 1.0, 2.0))
 
 
 def list_inputs(folder: Path) -> list[Path]:
@@ -220,8 +289,26 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
     #    the following passes use to throw out outliers.
     from .stack import Stacker, measure_channel_shift  # imported late: numba start-up is slow
 
-    stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)
     full = [align.half_to_full(w) for w in warps]
+    scale_note = None
+    if cfg.scale == "auto":
+        # A quick sensor-resolution stack tells us how blurred the data is.
+        probe = Stacker((ch, cw), meta.cfa, black, 1.0, cfg.radius)
+        for i in tqdm(kept, desc="probe", disable=cfg.quiet, unit="frame"):
+            probe.add(frames[i], gains[i], full[i], fields[i], f_off, f_step)
+        probe_sigma = finish.estimate_psf_sigma(probe.result()[..., 1])
+        chosen = choose_scale(probe_sigma)
+        scale_note = {"requested": "auto", "blur_sigma_at_sensor_scale": probe_sigma}
+        if probe_sigma is None:
+            say("auto scale: could not measure blur on the limb; staying at 1x")
+        elif chosen == 1.0:
+            say(f"auto scale: blur is {probe_sigma:.2f} px, so the sensor already records all the detail "
+                f"the lens and air delivered; staying at 1x")  # fmt: skip
+        else:
+            say(f"auto scale: blur is only {probe_sigma:.2f} px, so the sensor is the limit; stacking at {chosen:g}x")
+        cfg = replace(cfg, scale=chosen)
+        del probe
+    stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)
 
     # Red and blue land slightly displaced from green: the lens magnifies each
     # colour differently (so the displacement depends on where the moon sits on
@@ -276,11 +363,6 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
     if own is not None:
         meta.wb_daylight, meta.cam_srgb = own
         colour_source = "camera metadata"
-    wb = meta.wb_daylight if cfg.wb == "daylight" else meta.wb_as_shot
-    wb_used = cfg.wb
-    if wb is None:
-        wb = meta.wb_as_shot if meta.wb_as_shot is not None else np.ones(3, np.float32)
-        wb_used = "as-shot" if meta.wb_as_shot is not None else "none"
     if meta.cam_srgb is not None:
         matrix = meta.cam_srgb
     else:
@@ -290,18 +372,17 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
             say("note: no colour matrix for this camera; colours are white-balanced sensor RGB")
         elif Path(recs[ref_i]["path"]).suffix.lower() == ".arw":
             say("note: exiftool not found, so colour comes from LibRaw's tables, which can be wrong for new cameras")
-    white_span = float(meta.white - black.mean())
-    linear = finish.to_linear_srgb(stack_cam, white_span, wb, matrix)
-
-    measured = finish.estimate_psf_sigma(finish.luminance(linear))
-    if cfg.psf_sigma is not None:
-        sigma = cfg.psf_sigma
-    elif measured is not None:
-        sigma = float(np.clip(0.9 * measured, 0.5 * cfg.scale, 3.0 * cfg.scale))
-    else:
-        sigma = 1.0 * cfg.scale
-        say("could not measure blur on the limb; assuming a typical value")
-    sharp = finish.sharpen(linear, sigma, cfg.sharpen_iters) if cfg.sharpen_iters > 0 else linear
+    as_list = lambda a: None if a is None else [float(v) for v in a]  # noqa: E731
+    colour = {
+        "wb_daylight": as_list(meta.wb_daylight),
+        "wb_as_shot": as_list(meta.wb_as_shot),
+        "matrix": np.asarray(matrix, dtype=np.float64).tolist(),
+        "white_span": float(meta.white - black.mean()),
+        "scale": cfg.scale,
+        "flip": meta.flip,
+    }
+    linear, sharp, dev = develop(stack_cam, colour, cfg, say)
+    sigma = dev["psf_sigma_used"]
 
     kept_set = set(kept)
     report = []
@@ -337,10 +418,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         "moon_size_px": [int(np.median([r["bbox"][2] for r in recs])), int(np.median([r["bbox"][3] for r in recs]))],
         "output_size": [int(stack_cam.shape[1]), int(stack_cam.shape[0])],
         "rejected_sample_fraction": float(rej_frac),
-        "psf_sigma_measured": measured,
-        "psf_sigma_used": sigma,
-        "white_balance": wb_used,
-        "white_balance_multipliers": [float(v) for v in wb],
+        **dev,
         "colour_source": colour_source,
         "channel_magnification": [float(v) for v in mag],
         "channel_offset_px": b.tolist(),
@@ -348,14 +426,16 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         "saturated_fraction": clipped,
         "flip": meta.flip,
         "seconds": round(time.time() - t_start, 1),
+        "scale": cfg.scale,
+        "scale_auto": scale_note,
         "config": asdict(cfg),
     }
     say(f"stacked {len(kept)} of {n} frames; moon drifted {info['moon_drift_px']:.0f} px across the burst; "
         f"blur sigma {sigma:.2f} px; {info['seconds']} s")  # fmt: skip
-    return Result(stack_cam, linear, sharp, sigma, report, info)
+    return Result(stack_cam, linear, sharp, sigma, report, info, colour)
 
 
-def write_outputs(res: Result, out: Path, cfg: Config, flip: int = 0) -> dict[str, Path]:
+def write_outputs(res: Result, out: Path, cfg: Config, save_stack: bool = True) -> dict[str, Path]:
     import tifffile
     from PIL import Image, ImageCms
 
@@ -381,10 +461,11 @@ def write_outputs(res: Result, out: Path, cfg: Config, flip: int = 0) -> dict[st
         )
         files[name] = p
 
+    flip = int(res.colour.get("flip", 0))
     f = lambda a: finish.apply_flip(a, flip)  # noqa: E731
     tiff("moon_linear.tif", f(res.linear).astype(np.float32))
     natural = f(finish.render_natural(res.sharp))
-    mineral = f(finish.render_mineral(res.sharp, cfg.saturation, 2.0 * cfg.scale, cfg.flatten_colour))
+    mineral = f(finish.render_mineral(res.sharp, cfg.saturation, 2.0 * float(res.colour.get("scale", 1.0)), cfg.flatten_colour))
     tiff("moon_natural.tif", u16(natural), iccprofile=icc)
     tiff("moon_mineral.tif", u16(mineral), iccprofile=icc)
     jpeg("moon_natural.jpg", natural)
@@ -392,4 +473,9 @@ def write_outputs(res: Result, out: Path, cfg: Config, flip: int = 0) -> dict[st
     p = out / "report.json"
     p.write_text(json.dumps({"summary": res.info, "frames": res.frames}, indent=2))
     files["report.json"] = p
+    if save_stack:  # lets --rerender redo everything above without re-stacking
+        p = out / STACK_FILE
+        meta = json.dumps({"colour": res.colour, "summary": res.info, "frames": res.frames})
+        np.savez(p, stack_cam=res.stack_cam.astype(np.float32), meta=np.array(meta))
+        files[STACK_FILE] = p
     return files

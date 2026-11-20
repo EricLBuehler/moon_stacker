@@ -117,26 +117,95 @@ def richardson_lucy(Y: np.ndarray, sigma: float, iters: int) -> np.ndarray:
     return est - ped
 
 
-def sharpen(rgb: np.ndarray, sigma: float, iters: int = 25) -> np.ndarray:
+_MATCH_SIGMAS = (0.7, 1.2, 2.0, 3.5)
+_MATCH_TARGET = 1.0
+
+
+def limb_band(Y: np.ndarray, half_width: int = 10) -> np.ndarray | None:
+    """Mask of a strip straddling the sunlit limb (not the soft terminator)."""
+    top = float(np.percentile(Y, 99.5))
+    if top <= 0:
+        return None
+    sm = cv2.GaussianBlur((Y / top).astype(np.float32), (0, 0), 2.0)
+    grad = np.hypot(cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3))
+    contours, _ = cv2.findContours((sm > 0.08).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    pts = max(contours, key=len)[:, 0, :]
+    on = grad[pts[:, 1], pts[:, 0]]
+    steep = pts[on > 0.6 * np.percentile(on, 90)]
+    if len(steep) < 200:
+        return None
+    mask = np.zeros(Y.shape, np.uint8)
+    mask[steep[:, 1], steep[:, 0]] = 1
+    k = 2 * half_width + 1
+    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(bool)
+
+
+def match_channel_psf(rgb: np.ndarray) -> np.ndarray | None:
+    """Give red, green and blue the same blur, measured on the limb.
+
+    Lenses blur each colour a little differently, in shape as well as width.
+    At any hard edge the channels then rise and fall differently and leave a
+    coloured rim, which a saturation boost makes glaring. The sunlit limb is a
+    clean edge of constant colour, so there the three channels should be exact
+    multiples of one another. For red and blue we find the mix of blurred
+    copies of the channel that best reproduces slightly-blurred green across
+    the limb, then apply that mix everywhere.
+
+    Returns the matched image (a little softer than the input; it is only used
+    for colour, never for detail), or None if the limb cannot be used.
+    """
+    band = limb_band(luminance(rgb))
+    if band is None or band.sum() < 2000:
+        return None
+    blur = lambda a, s: cv2.GaussianBlur(a, (0, 0), s, borderType=cv2.BORDER_REFLECT)  # noqa: E731
+    target = blur(rgb[..., 1], _MATCH_TARGET)
+    out = np.empty_like(rgb)
+    out[..., 1] = target
+    t = target[band].astype(np.float64)
+    for c in (0, 2):
+        basis = [rgb[..., c]] + [blur(rgb[..., c], s) for s in _MATCH_SIGMAS]
+        A = np.stack([b[band] for b in basis], axis=1).astype(np.float64)
+        ridge = 1e-4 * np.trace(A.T @ A) / A.shape[1]
+        k = np.linalg.solve(A.T @ A + ridge * np.eye(A.shape[1]), A.T @ t)
+        if not np.isfinite(k).all() or k.sum() <= 0:
+            return None
+        k /= k.sum()  # keep the channel's overall level; only its blur changes
+        out[..., c] = sum(float(w) * b for w, b in zip(k, basis))
+    return out
+
+
+def sharpen(rgb: np.ndarray, sigma: float, iters: int = 25, match_psf: bool = True) -> np.ndarray:
     """Deconvolve brightness only, so colour noise is not amplified.
+
+    Colour is taken from blur-matched channels (see match_channel_psf) and
+    brightness from the deconvolved image.
 
     Deconvolution rings where the bright limb meets black sky. Within a few
     sigma of the sky we therefore limit the result to the range of values the
     unsharpened image has nearby.
     """
     Y = luminance(rgb).astype(np.float32)
-    Ys = richardson_lucy(Y, sigma, iters)
-
-    k = 2 * int(np.ceil(2.0 * sigma)) + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    clamped = np.clip(Ys, cv2.erode(Y, kernel), cv2.dilate(Y, kernel))
-    sky = (~disc_mask(Y, 0.02)).astype(np.uint8)
-    dist = cv2.distanceTransform(1 - sky, cv2.DIST_L2, 5)
-    w = np.clip(1.5 - dist / (3.0 * sigma + 1.0), 0, 1)
-    Ys = w * clamped + (1 - w) * Ys
-
-    ratio = np.where(Y > 1e-5 * float(Y.max()), Ys / np.maximum(Y, 1e-12), 1.0)
-    return rgb * np.clip(ratio, 0, 8)[..., None].astype(np.float32)
+    base, Yb = rgb, Y
+    matched = match_channel_psf(rgb) if match_psf else None
+    if matched is not None:
+        base = matched
+        Yb = luminance(base).astype(np.float32)
+    Ys = Y
+    if iters > 0:
+        Ys = richardson_lucy(Y, sigma, iters)
+        k = 2 * int(np.ceil(2.0 * sigma)) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        clamped = np.clip(Ys, cv2.erode(Y, kernel), cv2.dilate(Y, kernel))
+        sky = (~disc_mask(Y, 0.02)).astype(np.uint8)
+        dist = cv2.distanceTransform(1 - sky, cv2.DIST_L2, 5)
+        w = np.clip(1.5 - dist / (3.0 * sigma + 1.0), 0, 1)
+        Ys = w * clamped + (1 - w) * Ys
+    if base is rgb and iters <= 0:
+        return rgb
+    ratio = np.where(Yb > 1e-5 * float(Y.max()), Ys / np.maximum(Yb, 1e-12), 1.0)
+    return base * np.clip(ratio, 0, 8)[..., None].astype(np.float32)
 
 
 def srgb_encode(x: np.ndarray) -> np.ndarray:
@@ -211,8 +280,34 @@ def render_mineral(rgb: np.ndarray, saturation: float = 12.0, chroma_blur: float
     # Fade the boost out in the dark terminator, where colour is all noise.
     fade = np.clip((Y / top - 0.02) / 0.10, 0, 1)
     fade = fade * fade * (3 - 2 * fade)
-    out = Y[..., None] * (1.0 + saturation * fade[..., None] * chroma)
+    out = Y[..., None] * (1.0 + saturation * (fade * colour_trust(Y, top, saturation, chroma_blur))[..., None] * chroma)
     return srgb_encode(out * (0.85 / top)).astype(np.float32)
+
+
+def colour_trust(Y: np.ndarray, top: float, saturation: float, chroma_blur: float) -> np.ndarray:
+    """How much of the saturation boost each pixel can take, 0..1.
+
+    The three colours are registered to a few hundredths of a pixel and their
+    blurs matched to about a percent. That is not enough at hard edges once
+    colour is multiplied 20-30 times: the leftover shows as bright rims on the
+    limb and on crater shadows. Where brightness changes quickly relative to
+    its level, we know the colour ratio is unreliable by roughly
+    (misregistration x relative slope), and hold the boost back so that the
+    amplified error stays small. Next to the sky the boost is faded out
+    entirely.
+    """
+    edge_px = 0.08  # assumed leftover misregistration between colours
+    tolerated = 0.06  # amplified colour error we accept
+    Yb = np.maximum(cv2.GaussianBlur(Y, (0, 0), chroma_blur), 1e-4 * top)
+    slope = np.hypot(cv2.Sobel(Yb, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(Yb, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
+    err = edge_px * slope / Yb
+    trust = 1.0 / np.sqrt(1.0 + (saturation * err / tolerated) ** 2)
+    sky = (Y < 0.04 * top).astype(np.uint8)
+    dist = cv2.distanceTransform(1 - sky, cv2.DIST_L2, 5)
+    near = np.clip((dist - 2.0 * chroma_blur) / (5.0 * chroma_blur), 0, 1)
+    trust = trust * near * near * (3 - 2 * near)
+    # Smooth so the hold-back itself leaves no visible outline.
+    return cv2.GaussianBlur(trust.astype(np.float32), (0, 0), chroma_blur)
 
 
 def apply_flip(img: np.ndarray, flip: int) -> np.ndarray:

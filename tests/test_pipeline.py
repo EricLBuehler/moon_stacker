@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from moonstack import synth
-from moonstack.pipeline import Config, run, write_outputs
+from moonstack.pipeline import Config, choose_scale, rerender, run, write_outputs
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
@@ -61,6 +61,14 @@ def test_stack_matches_truth(burst, tmp_path):
     assert {"moon_linear.tif", "moon_natural.tif", "moon_mineral.tif", "report.json"} <= set(files)
     assert all(p.stat().st_size > 0 for p in files.values())
 
+    # Re-rendering from the saved stack reproduces the run, and honours new settings.
+    again = rerender(tmp_path / "out", cfg)
+    assert np.allclose(again.sharp, res.sharp, rtol=1e-4, atol=1e-6)
+    assert again.frames == res.frames
+    softer = rerender(tmp_path / "out", Config(quiet=True, sharpen_iters=0))
+    assert _error(softer.sharp, truth) > e_sharp
+    assert softer.info["config"]["sharpen_iters"] == 0
+
 
 def test_outlier_is_rejected(burst):
     """A streak painted across one frame must not show in the stack."""
@@ -103,3 +111,16 @@ def test_colour_fringing_is_corrected(burst, tmp_path):
     off = np.array(res.info["channel_offset_px"])
     assert np.allclose(off[0], (0.6, -0.3), atol=0.15) and np.allclose(off[2], (-0.5, 0.4), atol=0.15)
     assert res.info["channel_residual_px"] < 0.15
+
+
+def test_auto_scale(burst):
+    # Blurry data stays at sensor resolution; sharp data is enlarged, within limits.
+    assert choose_scale(1.44) == 1.0
+    assert choose_scale(0.8) == 1.5
+    assert choose_scale(0.3) == 2.0
+    assert choose_scale(None) == 1.0
+    folder, _, _ = burst
+    res = run(folder, Config(quiet=True, scale="auto"))
+    want = choose_scale(res.info["scale_auto"]["blur_sigma_at_sensor_scale"])
+    assert res.info["scale"] == want
+    assert res.stack_cam.shape[0] == round(want * res.info["output_size"][1] / want)
