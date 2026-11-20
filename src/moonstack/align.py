@@ -86,6 +86,9 @@ class LocalAligner:
         self.eA = (A * A).sum(axis=(-1, -2))
         cover = sliding_window_view(disc.astype(np.float32), (patch, patch))[::step, ::step].mean(axis=(-1, -2))
         inside = cover > 0.9
+        # Patches that hold any of the moon, including its edge. The edge is no use
+        # for measuring shifts (it only pins one direction) but shows blur well.
+        self.lit = cover > 0.05
         floor = 0.02 * float(np.median(self.eA[inside])) if inside.any() else np.inf
         self.valid = inside & (self.eA > floor)
         self.grid_shape = self.valid.shape
@@ -180,3 +183,67 @@ class LocalAligner:
             if self.valid.any():
                 conf_mean = float(conf[self.valid].mean())
         return field, conf_mean
+
+
+def region_sharpness(plane: np.ndarray, W: np.ndarray, aligner: LocalAligner, detail: float = 0.7) -> np.ndarray:
+    """Sharpness of one frame around each node of the aligner's grid.
+
+    Same measure as `sharpness` (edge strength relative to brightness), but
+    averaged over a neighbourhood the size of an alignment patch. It is
+    computed in the frame's own pixel grid and only the finished, smooth map is
+    looked up at the nodes: resampling the image first would blur it by an
+    amount that depends on the frame's sub-pixel position.
+    """
+    g = cv2.GaussianBlur(plane, (0, 0), detail)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    window = aligner.patch / 4.0
+    edges = cv2.GaussianBlur(gx * gx + gy * gy, (0, 0), window)
+    bright = cv2.GaussianBlur(g * g, (0, 0), window)
+    gh, gw = aligner.grid_shape
+    c0 = (aligner.patch - 1) / 2.0
+    ys, xs = np.mgrid[:gh, :gw].astype(np.float32) * aligner.step + c0
+    mx = W[0, 0] * xs + W[0, 1] * ys + W[0, 2]
+    my = W[1, 0] * xs + W[1, 1] * ys + W[1, 2]
+    at = lambda m: cv2.remap(m, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)  # noqa: E731
+    return at(edges) / (at(bright) + (1e-3 * aligner.norm) ** 2)
+
+
+def selection_weights(qa: np.ndarray, qb: np.ndarray, valid: np.ndarray, keep: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame, per-node stacking weights that favour each region's sharpest frames.
+
+    `qa` and `qb` (frames, gh, gw) are the regional sharpness measured on two
+    sets of sensor pixels that share no pixel, so their noise is independent.
+    Where the two agree on which frames are sharp, the ranking is real and the
+    sharpest `keep` fraction of frames is used. Where they disagree the ranking
+    is only noise (smooth ground), and every frame is used. The same goes for
+    where frames differ by only a few percent (steady air): too little to be
+    worth giving up frames for.
+
+    Returns the weights (frames, gh, gw), the per-node trust in the ranking,
+    and the per-node spread of real sharpness between frames (0.1 = 10%).
+    """
+    n = qa.shape[0]
+    a = qa - qa.mean(axis=0)
+    b = qb - qb.mean(axis=0)
+    shared = (a * b).sum(axis=0)  # what the two measurements agree on
+    r = shared / (np.sqrt((a * a).sum(axis=0) * (b * b).sum(axis=0)) + 1e-20)
+    # Agreement between two half-measurements -> reliability of their average.
+    trust = np.clip(2 * r / (1 + r), 0, 1)
+    spread = np.sqrt(np.maximum(shared, 0) / n) / (0.5 * (qa.mean(axis=0) + qb.mean(axis=0)) + 1e-20)
+    # Small differences (below about 2%) come from things other than blur,
+    # such as the slight local stretching that turbulence also causes.
+    trust = trust * np.clip((spread - 0.02) / 0.03, 0, 1)
+    trust = np.where(valid, trust, 0).astype(np.float32)
+    trust = cv2.GaussianBlur(trust, (0, 0), 1.0, borderType=cv2.BORDER_REPLICATE)
+
+    q = qa + qb
+    rank = np.argsort(np.argsort(-q, axis=0), axis=0) / max(n - 1, 1)  # 0 = sharpest
+    ramp = 0.1  # soft edge of the cut, as a fraction of the frames
+    chosen = np.clip((keep + ramp - rank) / (2 * ramp), 0, 1).astype(np.float32)
+    weights = np.empty_like(chosen)
+    for i in range(n):
+        # Blending between neighbouring regions keeps the mosaic seamless.
+        smooth = cv2.GaussianBlur(chosen[i], (0, 0), 1.0, borderType=cv2.BORDER_REPLICATE)
+        weights[i] = 1 - trust * (1 - smooth)
+    return weights, trust, spread.astype(np.float32)

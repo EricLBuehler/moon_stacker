@@ -61,8 +61,13 @@ def make_truth(size: int, radius: float, rng) -> np.ndarray:
 
 
 def generate(out: Path, frames=40, sensor=(1000, 1400), diameter=600, seed=0, peak_dn=7000.0,
-             drift=(3.0, 1.2), jitter=6.0, seeing=0.4, blur=(0.7, 1.1), gain_e_per_dn=0.5, read_dn=3.0):  # fmt: skip
-    """Write `frames` synthetic .npz raw files plus truth.npz into `out`."""
+             drift=(3.0, 1.2), jitter=6.0, seeing=0.4, blur=(0.7, 1.1), gain_e_per_dn=0.5, read_dn=3.0,
+             patchy=False):  # fmt: skip
+    """Write `frames` synthetic .npz raw files plus truth.npz into `out`.
+
+    Normally each frame has one blur over the whole disc. With `patchy`, the
+    blur varies smoothly across each frame, as real turbulence does.
+    """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
@@ -94,8 +99,16 @@ def generate(out: Path, frames=40, sensor=(1000, 1400), diameter=600, seed=0, pe
         qy = si * px + co * py + ct + D[..., 1]
         # Sensor pixel centre q covers oversampled pixels 2q and 2q+1; the box
         # filter above is anchored at its top-left, so sample at 2q.
-        img = cv2.remap(blurred[lvl], (OVERSAMPLE * qx).astype(np.float32), (OVERSAMPLE * qy).astype(np.float32), cv2.INTER_CUBIC,
-                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)  # fmt: skip
+        mx, my = (OVERSAMPLE * qx).astype(np.float32), (OVERSAMPLE * qy).astype(np.float32)
+        sample = lambda k: cv2.remap(blurred[k], mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)  # noqa: E731
+        if patchy:
+            # A smooth random map says which blur level applies where.
+            cells = cv2.GaussianBlur(rng.standard_normal((H // 96 + 3, W // 96 + 3)).astype(np.float32), (0, 0), 1.0)
+            cells = (cells - cells.min()) / (cells.max() - cells.min()) * (len(levels) - 1)
+            level_map = cv2.resize(cells, (W, H), interpolation=cv2.INTER_CUBIC)
+            img = sum(np.clip(1 - np.abs(level_map - k), 0, 1)[..., None] * sample(k) for k in range(len(levels)))
+        else:
+            img = sample(lvl)
         cam = np.clip(img, 0, None) / WB.astype(np.float32) * (peak_dn / 0.8 * g)
         mosaic = np.empty((H, W), np.float32)
         for ty in range(2):

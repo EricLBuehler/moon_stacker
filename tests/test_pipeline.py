@@ -126,3 +126,21 @@ def test_auto_scale(burst):
     want = choose_scale(res.info["scale_auto"]["blur_sigma_at_sensor_scale"])
     assert res.info["scale"] == want
     assert res.stack_cam.shape[0] == round(want * res.info["output_size"][1] / want)
+
+
+def test_regional_selection(burst, tmp_path):
+    """Blur that varies across each frame: picking frames per region beats picking whole frames."""
+    truth, _ = synth.generate(tmp_path, frames=40, sensor=(640, 800), diameter=360, seed=2, blur=(0.6, 1.8), patchy=True)
+    whole = run(tmp_path, Config(quiet=True))
+    regional = run(tmp_path, Config(quiet=True, local_keep=0.4))
+    sel = regional.info["regional_selection"]
+    assert sel["disc_fraction_selected"] > 0.8 and sel["sharpness_spread"] > 0.05
+    assert _error(regional.linear, truth) < 0.97 * _error(whole.linear, truth)
+    assert _error(regional.sharp, truth) < 0.95 * _error(whole.sharp, truth)
+
+    # The ordinary burst has one blur per frame from a narrow range and few
+    # frames; whatever is selected there must not make the result worse.
+    folder, truth, _ = burst
+    plain = run(folder, Config(quiet=True))
+    picky = run(folder, Config(quiet=True, local_keep=0.4))
+    assert _error(picky.sharp, truth) < 1.05 * _error(plain.sharp, truth)

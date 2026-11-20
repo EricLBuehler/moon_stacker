@@ -33,6 +33,7 @@ class Config:
     sharpen_iters: int = 25
     saturation: float = 12.0
     flatten_colour: bool = True  # remove the smooth colour slope across the disc in the mineral image
+    local_keep: float | None = None  # within each region, stack only its sharpest fraction of frames
     partial_decode: bool = True  # decode only the tiles around the moon when the format allows
     jobs: int = 0  # 0 = all cores
     quiet: bool = False
@@ -300,6 +301,37 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
                     local_conf[i] = res[1]
         else:
             say("moon too small for local alignment; using global alignment only")
+
+    # 3b. Optionally favour, region by region, the frames that were sharpest there.
+    weights = None
+    selection = None
+    if cfg.local_keep is not None and cfg.local_keep < 1:
+        if fields.shape[1] == 1:
+            say("regional frame selection needs the local alignment; using whole frames")
+        else:
+            # The two green pixels of each 2x2 sensor tile give two images of
+            # the same scene with independent noise.
+            (ya, xa), (yb, xb) = np.argwhere(meta.cfa == 1)[:2]
+
+            def regional(i):
+                planes = (frames[i][ya::2, xa::2] - black[ya, xa], frames[i][yb::2, xb::2] - black[yb, xb])
+                return [align.region_sharpness(p.astype(np.float32), warps[i], aligner) for p in planes]
+
+            q = np.array(list(tqdm(threads.map(regional, kept), total=len(kept), desc="regions", disable=cfg.quiet, unit="frame")))
+            w, trust, spread = align.selection_weights(q[:, 0], q[:, 1], aligner.lit, cfg.local_keep)
+            weights = np.ones(fields.shape[:3], np.float32)
+            weights[kept] = w
+            used = float((trust[aligner.lit] > 0.5).mean())
+            selection = {
+                "keep": cfg.local_keep,
+                "disc_fraction_selected": used,
+                "sharpness_spread": float(np.median(spread[aligner.lit])),
+                "mean_trust": float(trust[aligner.lit].mean()),
+                "mean_weight": float(w[:, aligner.lit].mean()),
+            }
+            say(f"regional selection: sharpness varies by about {100 * selection['sharpness_spread']:.0f}% between frames; "
+                + (f"over {100 * used:.0f}% of the disc each region uses its sharpest {100 * cfg.local_keep:.0f}% of frames"
+                   if used > 0.01 else "too little to select on, so every frame is used everywhere"))  # fmt: skip
     threads.shutdown()
 
     # 4. Bayer drizzle. A first stack at sensor resolution measures what the
@@ -322,7 +354,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         with tqdm(total=len(kept), desc=desc, disable=cfg.quiet, unit="frame") as bar:
             for s in range(0, len(kept), BATCH):
                 batch = kept[s : s + BATCH]
-                stacker.add(frames, batch, gains, full, fields, f_off, f_step, reject, cfg.kappa, chans)
+                stacker.add(frames, batch, gains, full, fields, f_off, f_step, reject, cfg.kappa, chans, weights)
                 bar.update(len(batch))
 
     def channel_error(m):
@@ -430,6 +462,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
             "matrix": M.tolist(),
             "align_score": float(cc[i]),
             "local_rms_px": float(np.sqrt(np.mean(fields[i] ** 2))) if i in kept_set else None,
+            "regional_weight": float(weights[i].mean()) if weights is not None and i in kept_set else None,
         })  # fmt: skip
     for d in dropped:
         report.append({"file": d["file"], "stacked": False, "dropped": d["reason"]})
@@ -456,6 +489,7 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         "seconds": round(time.time() - t_start, 1),
         "scale": cfg.scale,
         "scale_auto": scale_note,
+        "regional_selection": selection,
         "config": asdict(cfg),
     }
     say(f"stacked {len(kept)} of {n} frames; moon drifted {info['moon_drift_px']:.0f} px across the burst; "

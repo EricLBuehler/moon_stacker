@@ -56,6 +56,10 @@ badly off for the a7R VI.
 ## Options worth knowing
 
 - `--keep 0.8` fraction of frames stacked. Lower is sharper, higher is cleaner.
+- `--local-keep 0.5` regional frame selection (off by default). Turbulence blurs different parts of the moon in
+  different frames, so each small region is stacked from the frames that were sharpest *there*, blended
+  smoothly. It only acts where frames measurably differ in sharpness (by more than a few percent), and
+  uses every frame elsewhere. Sharper, a little noisier; best with several hundred frames or more.
 - `--scale 1.5` output larger than the sensor grid; can recover detail if the lens out-resolves the sensor.
   `--scale auto` measures the blur and picks the grid on which the sharpened image renders smoothly.
 - `--radius 0.75` stacking kernel width. Smaller is sharper but noisier.

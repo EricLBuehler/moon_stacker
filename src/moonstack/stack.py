@@ -24,6 +24,7 @@ def _accumulate(
     Ms,  # float64 (N, 2, 3) reference -> frame, full-res raw pixel coords
     chans,  # float64 (N, 3, 3) per colour: scale, x offset, y offset in frame coords
     fields,  # float32 (N, gh, gw, 2) local (dx, dy) in full-res pixels
+    weights,  # float32 (N, gh, gw) how much each frame counts, on the same grid; (N, 1, 1) = not used
     f_off,
     f_step,
     scale,  # output pixels per raw pixel
@@ -43,6 +44,7 @@ def _accumulate(
     H, W = frames.shape[1], frames.shape[2]
     Ho, Wo = num.shape[0], num.shape[1]
     gh, gw = fields.shape[1], fields.shape[2]
+    weighted = weights.shape[1] == gh and weights.shape[2] == gw and gh > 1
     inv_s = 1.0 / scale
     inv_r = 1.0 / radius
     # A faint full-width kernel guarantees coverage where the sharp kernel
@@ -69,6 +71,7 @@ def _accumulate(
             f = idx[k]
             raw = frames[f]
             field = fields[f]
+            weight = weights[f]
             M = Ms[f]
             chan = chans[f]
             gain = gains[f]
@@ -92,6 +95,11 @@ def _accumulate(
                 w11 = tx * ty
                 dx = w00 * field[iy0, ix0, 0] + w01 * field[iy0, ix1, 0] + w10 * field[iy1, ix0, 0] + w11 * field[iy1, ix1, 0]
                 dy = w00 * field[iy0, ix0, 1] + w01 * field[iy0, ix1, 1] + w10 * field[iy1, ix0, 1] + w11 * field[iy1, ix1, 1]
+                fw = 1.0
+                if weighted:
+                    fw = w00 * weight[iy0, ix0] + w01 * weight[iy0, ix1] + w10 * weight[iy1, ix0] + w11 * weight[iy1, ix1]
+                    if fw <= 0.0:
+                        continue
                 px = rx + dx
                 py = ry + dy
                 fx = M[0, 0] * px + M[0, 1] * py + M[0, 2]
@@ -117,7 +125,7 @@ def _accumulate(
                     ay = abs(yy - qy)
                     sx = max(1.0 - ax * inv_r, 0.0)
                     sy = max(1.0 - ay * inv_r, 0.0)
-                    w = sx * sy + eps * (1.0 - ax) * (1.0 - ay)
+                    w = (sx * sy + eps * (1.0 - ax) * (1.0 - ay)) * fw
                     if w <= 0.0:
                         continue
                     val = (raw[yy, xx] - black[sy_par, sx_par]) * gain
@@ -172,16 +180,19 @@ class Stacker:
         self.vmax, self.wmax, self.vmin, self.wmin = z(-np.inf), z(), z(np.inf), z()
         self.rejected = 0
 
-    def add(self, frames, idx, gains, Ms, fields, f_off, f_step, reject=False, kappa=3.0, chans=None):
+    def add(self, frames, idx, gains, Ms, fields, f_off, f_step, reject=False, kappa=3.0, chans=None, weights=None):
         """Add frames[i] for each i in idx. All per-frame arrays are indexed like `frames`."""
         n = len(frames)
         if chans is None:
             chans = np.broadcast_to(_NO_SHIFT, (n, 3, 3))
+        if weights is None:
+            weights = np.ones((n, 1, 1), np.float32)
         self.rejected += _accumulate(
             frames, np.asarray(idx, dtype=np.int64), self.cfa, self.black,
             np.ascontiguousarray(gains, dtype=np.float32), np.ascontiguousarray(Ms, dtype=np.float64),
             np.ascontiguousarray(chans, dtype=np.float64),
-            np.ascontiguousarray(fields, dtype=np.float32), float(f_off), float(f_step),
+            np.ascontiguousarray(fields, dtype=np.float32), np.ascontiguousarray(weights, dtype=np.float32),
+            float(f_off), float(f_step),
             self.scale, self.radius, self.num, self.den, self.sq,
             self.vmax, self.wmax, self.vmin, self.wmin,
             reject, self.mean, self.sigma, np.float32(kappa),
