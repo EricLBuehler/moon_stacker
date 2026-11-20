@@ -114,10 +114,12 @@ def test_colour_fringing_is_corrected(burst, tmp_path):
 
 
 def test_auto_scale(burst):
-    # Blurry data stays at sensor resolution; sharp data is enlarged, within limits.
-    assert choose_scale(1.44) == 1.0
-    assert choose_scale(0.8) == 1.5
-    assert choose_scale(0.3) == 2.0
+    # The grid is chosen for the finished image: finer when sharpening will
+    # shrink the blur below what the sensor grid renders smoothly.
+    assert choose_scale(1.46) == 1.5
+    assert choose_scale(1.46, sharpening=False) == 1.0
+    assert choose_scale(2.4) == 1.0
+    assert choose_scale(0.8) == 2.0
     assert choose_scale(None) == 1.0
     folder, _, _ = burst
     res = run(folder, Config(quiet=True, scale="auto"))

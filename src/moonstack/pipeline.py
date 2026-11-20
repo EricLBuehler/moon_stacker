@@ -102,19 +102,24 @@ def rerender(out: Path, cfg: Config) -> Result:
 
 # Blur (Gaussian sigma, in output pixels) at which detail is comfortably
 # sampled: finer than this and the pixel grid, not the optics, limits detail.
-_WELL_SAMPLED_SIGMA = 1.2
+_WELL_SAMPLED_SIGMA = 1.3
+# Deconvolution shrinks the blur to roughly this fraction (measured on
+# synthetic data at the default strength), so the finished image holds finer
+# detail than the stack it was made from and needs a finer grid to show it.
+_SHARPENED_FRACTION = 0.6
 
 
-def choose_scale(sigma: float | None) -> float:
+def choose_scale(sigma: float | None, sharpening: bool = True) -> float:
     """Output scale for --scale auto, from the blur measured at sensor scale.
 
-    Enlarges only when the image is sharper than the sensor grid can show,
-    just enough to bring the blur up to a well-sampled size. Steps of 0.25,
-    at most 2x.
+    Picks the grid on which the *finished* (sharpened) image is well sampled:
+    enough pixels across its finest detail that edges render smoothly instead
+    of blocky. Steps of 0.25, between 1x and 2x.
     """
     if sigma is None or sigma <= 0:
         return 1.0
-    return float(np.clip(np.round(_WELL_SAMPLED_SIGMA / sigma * 4) / 4, 1.0, 2.0))
+    final = sigma * (_SHARPENED_FRACTION if sharpening else 1.0)
+    return float(np.clip(np.round(_WELL_SAMPLED_SIGMA / final * 4) / 4, 1.0, 2.0))
 
 
 def list_inputs(folder: Path) -> list[Path]:
@@ -299,15 +304,15 @@ def _process(frames, recs, dropped, meta, cfg, say, jobs, t_start) -> Result:
         for i in tqdm(kept, desc="probe", disable=cfg.quiet, unit="frame"):
             probe.add(frames[i], gains[i], full[i], fields[i], f_off, f_step)
         probe_sigma = finish.estimate_psf_sigma(probe.result()[..., 1])
-        chosen = choose_scale(probe_sigma)
+        chosen = choose_scale(probe_sigma, cfg.sharpen_iters > 0)
         scale_note = {"requested": "auto", "blur_sigma_at_sensor_scale": probe_sigma}
         if probe_sigma is None:
             say("auto scale: could not measure blur on the limb; staying at 1x")
         elif chosen == 1.0:
-            say(f"auto scale: blur is {probe_sigma:.2f} px, so the sensor already records all the detail "
-                f"the lens and air delivered; staying at 1x")  # fmt: skip
+            say(f"auto scale: blur is {probe_sigma:.2f} px; the sensor grid shows the sharpened image fully, staying at 1x")
         else:
-            say(f"auto scale: blur is only {probe_sigma:.2f} px, so the sensor is the limit; stacking at {chosen:g}x")
+            say(f"auto scale: blur is {probe_sigma:.2f} px; stacking at {chosen:g}x so the sharpened image has "
+                f"enough pixels to render smoothly")  # fmt: skip
         cfg = replace(cfg, scale=chosen)
         del probe
     stacker = Stacker((ch, cw), meta.cfa, black, cfg.scale, cfg.radius)

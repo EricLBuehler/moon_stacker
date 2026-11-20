@@ -33,7 +33,7 @@ def main(argv=None) -> int:
                     help="fraction of frames to stack, sharpest first (default 0.8)")  # fmt: skip
     ap.add_argument("--scale", type=_scale, default=1.0,
                     help="output pixels per sensor pixel (default 1). 1.5 or 2 stacks onto a finer grid; "
-                         "'auto' measures the blur and enlarges only if the sensor, not the lens, limits detail")  # fmt: skip
+                         "'auto' measures the blur and picks the grid on which the sharpened image renders smoothly")  # fmt: skip
     ap.add_argument("--radius", type=float, default=0.75,
                     help="stacking kernel half-width in sensor pixels, 0.3-1; smaller is sharper but noisier (default 0.75)")  # fmt: skip
     ap.add_argument("--kappa", type=float, default=3.0,

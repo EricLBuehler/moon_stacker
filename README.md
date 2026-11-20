@@ -54,7 +54,7 @@ badly off for the a7R VI.
 
 - `--keep 0.8` fraction of frames stacked. Lower is sharper, higher is cleaner.
 - `--scale 1.5` output larger than the sensor grid; can recover detail if the lens out-resolves the sensor.
-  `--scale auto` measures the blur first and enlarges only when that is the case.
+  `--scale auto` measures the blur and picks the grid on which the sharpened image renders smoothly.
 - `--radius 0.75` stacking kernel width. Smaller is sharper but noisier.
 - `--sharpen-iters 25`, `--psf-sigma` deconvolution strength and blur override.
 - `--saturation 12` colour boost of the mineral image.
