@@ -1,3 +1,2 @@
-uv run moonstack /Users/ericbuehler/Dropbox/sony_a7r_6_photos/2026/nov_19_moon --saturation 30
+uv run moonstack /Users/ericbuehler/Dropbox/sony_a7r_6_photos/2026/nov_19_moon --scale auto --saturation 30
 uv run moonstack /Users/ericbuehler/Dropbox/sony_a7r_6_photos/2026/nov_19_moon --rerender --saturation 30
-uv run moonstack /Users/ericbuehler/Dropbox/sony_a7r_6_photos/2026/nov_19_moon --scale 1.5 --saturation 30

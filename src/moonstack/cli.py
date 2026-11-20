@@ -44,7 +44,7 @@ def main(argv=None) -> int:
     ap.add_argument("--wb", choices=["daylight", "as-shot"], default="daylight",
                     help="white balance (default daylight: the moon is sunlit rock)")  # fmt: skip
     ap.add_argument("--psf-sigma", type=float, help="blur to remove, in output pixels (default: measured on the limb)")
-    ap.add_argument("--sharpen-iters", type=int, default=25, help="deconvolution iterations; 0 disables (default 25)")
+    ap.add_argument("--sharpen-iters", type=int, default=25, help="deconvolution iterations at 1x scale; 0 disables (default 25)")
     ap.add_argument("--saturation", type=float, default=12.0, help="colour boost of the mineral image (default 12)")
     ap.add_argument("--no-colour-flatten", action="store_true",
                     help="keep the smooth colour slope across the disc in the mineral image")  # fmt: skip
