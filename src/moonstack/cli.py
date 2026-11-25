@@ -29,14 +29,14 @@ def main(argv=None) -> int:
     ap.add_argument("--rerender", action="store_true",
                     help="reuse the stack saved by a previous run and only redo colour, sharpening and "
                          "rendering (--wb, --psf-sigma, --sharpen-iters, --saturation, --no-colour-flatten, --pair)")  # fmt: skip
-    ap.add_argument("--keep", type=float, default=0.8,
-                    help="fraction of frames to stack, sharpest first (default 0.8)")  # fmt: skip
-    ap.add_argument("--local-keep", type=float,
+    ap.add_argument("--keep", type=float, default=0.5,
+                    help="fraction of frames to stack, sharpest first (default 0.5). Lower is sharper, higher is less grainy")  # fmt: skip
+    ap.add_argument("--local-keep", type=float, default=0.5,
                     help="regional frame selection: in each small region of the moon, stack only the fraction of "
-                         "frames that were sharpest there (e.g. 0.5). Off by default; best with many frames")  # fmt: skip
-    ap.add_argument("--scale", type=_scale, default=1.0,
-                    help="output pixels per sensor pixel (default 1). 1.5 or 2 stacks onto a finer grid; "
-                         "'auto' measures the blur and picks the grid on which the sharpened image renders smoothly")  # fmt: skip
+                         "the kept frames that were sharpest there (default 0.5; 1 turns it off)")  # fmt: skip
+    ap.add_argument("--scale", type=_scale, default="auto",
+                    help="output pixels per sensor pixel. The default, 'auto', measures the blur and picks the grid "
+                         "on which the sharpened image renders smoothly; 1, 1.5 or 2 fixes it")  # fmt: skip
     ap.add_argument("--radius", type=float, default=0.75,
                     help="stacking kernel half-width in sensor pixels, 0.3-1; smaller is sharper but noisier (default 0.75)")  # fmt: skip
     ap.add_argument("--kappa", type=float, default=3.0,

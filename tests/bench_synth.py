@@ -13,6 +13,8 @@ from scipy.optimize import minimize_scalar
 from moonstack import finish, synth
 from moonstack.pipeline import Config, run
 
+# The plain recipe the numbers below were tuned on; the tool's defaults are more selective.
+PLAIN = dict(quiet=True, keep=0.8, scale=1.0, local_keep=None)
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 
@@ -104,13 +106,13 @@ def main():
     rows = [("single frame, demosaiced", single, truth, mask0), ("conventional stack, oracle align, all frames", conv, truth, mask0)]
 
     variants = {
-        "moonstack default": Config(quiet=True),
-        "  no local field": Config(quiet=True, local=False),
-        "  radius 1.0": Config(quiet=True, radius=1.0),
-        "  radius 0.5": Config(quiet=True, radius=0.5),
-        "  keep all": Config(quiet=True, keep=1.0),
-        "  no rejection": Config(quiet=True, kappa=0),
-        "  scale 1.5": Config(quiet=True, scale=1.5),
+        "moonstack plain": Config(**PLAIN),
+        "  no local field": Config(**PLAIN, local=False),
+        "  radius 1.0": Config(**PLAIN, radius=1.0),
+        "  radius 0.5": Config(**PLAIN, radius=0.5),
+        "  keep all": Config(**dict(PLAIN, keep=1.0)),
+        "  no rejection": Config(**PLAIN, kappa=0),
+        "  scale 1.5": Config(**dict(PLAIN, scale=1.5)),
     }
     sharp_rows = []
     for name, cfg in variants.items():

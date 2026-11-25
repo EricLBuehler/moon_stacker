@@ -6,6 +6,8 @@ import pytest
 from moonstack import synth
 from moonstack.pipeline import Config, choose_scale, rerender, run, write_outputs
 
+# The plain recipe the numbers below were tuned on; the tool's defaults are more selective.
+PLAIN = dict(quiet=True, keep=0.8, scale=1.0, local_keep=None)
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 
@@ -31,7 +33,7 @@ def _error(img, truth):
 
 def test_stack_matches_truth(burst, tmp_path):
     folder, truth, params = burst
-    cfg = Config(quiet=True)
+    cfg = Config(**PLAIN)
     res = run(folder, cfg)
     assert res.info["frames_stacked"] == 19
 
@@ -65,9 +67,9 @@ def test_stack_matches_truth(burst, tmp_path):
     again = rerender(tmp_path / "out", cfg)
     assert np.allclose(again.sharp, res.sharp, rtol=1e-4, atol=1e-6)
     assert again.frames == res.frames
-    paired = write_outputs(again, tmp_path / "pair", Config(quiet=True, pair=True), save_stack=False)
+    paired = write_outputs(again, tmp_path / "pair", Config(**PLAIN, pair=True), save_stack=False)
     assert paired["moon_pair.jpg"].stat().st_size > 0 and "moon_pair.jpg" not in files
-    softer = rerender(tmp_path / "out", Config(quiet=True, sharpen_iters=0))
+    softer = rerender(tmp_path / "out", Config(**PLAIN, sharpen_iters=0))
     assert _error(softer.sharp, truth) > e_sharp
     assert softer.info["config"]["sharpen_iters"] == 0
 
@@ -79,7 +81,7 @@ def test_outlier_is_rejected(burst):
     z = dict(np.load(f))
     clean = z["bayer"].copy()
     # Pinned reference and no channel re-registration: one shared geometry.
-    cfg = dict(quiet=True, keep=1.0, reference="synth_0000.npz", chroma_align=False)
+    cfg = dict(PLAIN, keep=1.0, reference="synth_0000.npz", chroma_align=False)
     try:
         z["bayer"][318:322, 330:470] = 16000  # short streak across the disc
         np.savez(f, **z)
@@ -109,7 +111,7 @@ def test_colour_fringing_is_corrected(burst, tmp_path):
             b[ty::2, tx::2] = cv2.warpAffine(plane, M, (w // 2, h // 2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         z["bayer"] = np.clip(np.round(b), 0, 16383).astype(np.uint16)
         np.savez(out / f.name, **z)
-    res = run(out, Config(quiet=True))
+    res = run(out, Config(**PLAIN))
     off = np.array(res.info["channel_offset_px"])
     assert np.allclose(off[0], (0.6, -0.3), atol=0.15) and np.allclose(off[2], (-0.5, 0.4), atol=0.15)
     assert res.info["channel_residual_px"] < 0.15
@@ -124,7 +126,7 @@ def test_auto_scale(burst):
     assert choose_scale(0.8) == 2.0
     assert choose_scale(None) == 1.0
     folder, _, _ = burst
-    res = run(folder, Config(quiet=True, scale="auto"))
+    res = run(folder, Config(**dict(PLAIN, scale="auto")))
     want = choose_scale(res.info["scale_auto"]["blur_sigma_at_sensor_scale"])
     assert res.info["scale"] == want
     assert res.stack_cam.shape[0] == round(want * res.info["output_size"][1] / want)
@@ -133,8 +135,8 @@ def test_auto_scale(burst):
 def test_regional_selection(burst, tmp_path):
     """Blur that varies across each frame: picking frames per region beats picking whole frames."""
     truth, _ = synth.generate(tmp_path, frames=40, sensor=(640, 800), diameter=360, seed=2, blur=(0.6, 1.8), patchy=True)
-    whole = run(tmp_path, Config(quiet=True))
-    regional = run(tmp_path, Config(quiet=True, local_keep=0.4))
+    whole = run(tmp_path, Config(**PLAIN))
+    regional = run(tmp_path, Config(**dict(PLAIN, local_keep=0.4)))
     sel = regional.info["regional_selection"]
     assert sel["disc_fraction_selected"] > 0.8 and sel["sharpness_spread"] > 0.05
     assert _error(regional.linear, truth) < 0.97 * _error(whole.linear, truth)
@@ -143,6 +145,6 @@ def test_regional_selection(burst, tmp_path):
     # The ordinary burst has one blur per frame from a narrow range and few
     # frames; whatever is selected there must not make the result worse.
     folder, truth, _ = burst
-    plain = run(folder, Config(quiet=True))
-    picky = run(folder, Config(quiet=True, local_keep=0.4))
+    plain = run(folder, Config(**PLAIN))
+    picky = run(folder, Config(**dict(PLAIN, local_keep=0.4)))
     assert _error(picky.sharp, truth) < 1.05 * _error(plain.sharp, truth)

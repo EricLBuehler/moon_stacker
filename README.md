@@ -56,13 +56,14 @@ badly off for the a7R VI.
 ## Options worth knowing
 
 - `--pair` also writes `moon_pair.jpg`: natural and mineral side by side, cropped to the moon. Works with `--rerender`.
-- `--keep 0.8` fraction of frames stacked. Lower is sharper, higher is cleaner.
-- `--local-keep 0.5` regional frame selection (off by default). Turbulence blurs different parts of the moon in
+- `--keep 0.5` fraction of frames stacked, sharpest first. Lower is sharper, higher is less grainy.
+  With a short burst (under a hundred frames or so) try `--keep 0.8`.
+- `--local-keep 0.5` regional frame selection (`--local-keep 1` turns it off). Turbulence blurs different parts of the moon in
   different frames, so each small region is stacked from the frames that were sharpest *there*, blended
   smoothly. It only acts where frames measurably differ in sharpness (by more than a few percent), and
-  uses every frame elsewhere. Sharper, a little noisier; best with several hundred frames or more.
-- `--scale 1.5` output larger than the sensor grid; can recover detail if the lens out-resolves the sensor.
-  `--scale auto` measures the blur and picks the grid on which the sharpened image renders smoothly.
+  uses every frame elsewhere. Sharper, a little noisier.
+- `--scale auto` (the default) measures the blur and picks the output grid on which the sharpened image
+  renders smoothly, often 1.5x the sensor grid. `--scale 1` or `--scale 1.5` fixes it.
 - `--radius 0.75` stacking kernel width. Smaller is sharper but noisier.
 - `--sharpen-iters 25`, `--psf-sigma` deconvolution strength and blur override.
 - `--saturation 12` colour boost of the mineral image.

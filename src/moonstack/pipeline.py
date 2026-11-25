@@ -21,8 +21,8 @@ from .ingest import RAW_EXTS, SYNTH_EXT, half_luma, ingest_one, sony_colour, til
 
 @dataclass
 class Config:
-    keep: float = 0.8  # fraction of frames to stack, sharpest first
-    scale: float | str = 1.0  # output pixels per sensor pixel, or "auto" to choose from the measured blur
+    keep: float = 0.5  # fraction of frames to stack, sharpest first
+    scale: float | str = "auto"  # output pixels per sensor pixel, or "auto" to choose from the measured blur
     radius: float = 0.75  # drizzle kernel half-width in sensor pixels
     kappa: float = 3.0  # outlier rejection threshold in sigmas (0 = off)
     local: bool = True  # correct turbulence warping with a local field
@@ -34,7 +34,7 @@ class Config:
     saturation: float = 12.0
     flatten_colour: bool = True  # remove the smooth colour slope across the disc in the mineral image
     pair: bool = False  # also write natural and mineral side by side as one picture
-    local_keep: float | None = None  # within each region, stack only its sharpest fraction of frames
+    local_keep: float | None = 0.5  # within each region, stack only its sharpest fraction of frames (None or 1 = off)
     partial_decode: bool = True  # decode only the tiles around the moon when the format allows
     jobs: int = 0  # 0 = all cores
     quiet: bool = False
