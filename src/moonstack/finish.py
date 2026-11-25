@@ -117,8 +117,12 @@ def richardson_lucy(Y: np.ndarray, sigma: float, iters: int) -> np.ndarray:
     return est - ped
 
 
+# Blur-matching kernel, in sensor pixels: centred Gaussians of these widths,
+# plus Gaussians of width w displaced by r in eight directions, as (r, w).
 _MATCH_SIGMAS = (0.7, 1.2, 2.0, 3.5)
+_MATCH_RINGS = ((2.0, 1.2), (5.0, 2.0), (10.0, 3.5))
 _MATCH_TARGET = 1.0
+_MATCH_BAND = 16  # half-width of the strip of limb the fit looks at
 
 
 def limb_band(Y: np.ndarray, half_width: int = 10) -> np.ndarray | None:
@@ -142,41 +146,62 @@ def limb_band(Y: np.ndarray, half_width: int = 10) -> np.ndarray | None:
     return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(bool)
 
 
-def match_channel_psf(rgb: np.ndarray) -> np.ndarray | None:
+def match_channel_psf(rgb: np.ndarray, scale: float = 1.0) -> np.ndarray | None:
     """Give red, green and blue the same blur, measured on the limb.
 
-    Lenses blur each colour a little differently, in shape as well as width.
-    At any hard edge the channels then rise and fall differently and leave a
-    coloured rim, which a saturation boost makes glaring. The sunlit limb is a
-    clean edge of constant colour, so there the three channels should be exact
-    multiples of one another. For red and blue we find the mix of blurred
-    copies of the channel that best reproduces slightly-blurred green across
-    the limb, then apply that mix everywhere.
+    Lens and atmosphere blur each colour a little differently, in shape as
+    well as width. The air also spreads each colour into a short spectrum
+    along the direction of the horizon, more so for blue, so the blur can be
+    lopsided. At any hard edge the channels then rise and fall differently
+    and leave a coloured rim, which a saturation boost makes glaring. The
+    sunlit limb is a clean edge of constant colour, so there the three
+    channels should be exact multiples of one another. For red and blue we
+    find the mix of blurred and displaced copies of the channel that best
+    reproduces slightly-blurred green across the limb, then apply that mix
+    everywhere.
 
-    Returns the matched image (a little softer than the input; it is only used
-    for colour, never for detail), or None if the limb cannot be used.
+    `scale` is output pixels per sensor pixel. Returns the matched image (a
+    little softer than the input; it is only used for colour, never for
+    detail), or None if the limb cannot be used.
     """
-    band = limb_band(luminance(rgb))
+    band = limb_band(luminance(rgb), int(round(_MATCH_BAND * scale)))
     if band is None or band.sum() < 2000:
         return None
-    blur = lambda a, s: cv2.GaussianBlur(a, (0, 0), s, borderType=cv2.BORDER_REFLECT)  # noqa: E731
+    h, w = rgb.shape[:2]
+    blur = lambda a, s: cv2.GaussianBlur(a, (0, 0), s * scale, borderType=cv2.BORDER_REFLECT)  # noqa: E731
+
+    def basis(ch):
+        """The candidate copies of one channel, one at a time (they are large)."""
+        yield ch
+        for s in _MATCH_SIGMAS:
+            yield blur(ch, s)
+        for r, s in _MATCH_RINGS:
+            soft = blur(ch, s)
+            for i in range(8):
+                dx, dy = r * scale * np.cos(i * np.pi / 4), r * scale * np.sin(i * np.pi / 4)
+                move = np.float32([[1, 0, dx], [0, 1, dy]])
+                yield cv2.warpAffine(soft, move, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
     target = blur(rgb[..., 1], _MATCH_TARGET)
     out = np.empty_like(rgb)
     out[..., 1] = target
     t = target[band].astype(np.float64)
     for c in (0, 2):
-        basis = [rgb[..., c]] + [blur(rgb[..., c], s) for s in _MATCH_SIGMAS]
-        A = np.stack([b[band] for b in basis], axis=1).astype(np.float64)
+        ch = np.ascontiguousarray(rgb[..., c])
+        A = np.stack([b[band] for b in basis(ch)], axis=1).astype(np.float64)
         ridge = 1e-4 * np.trace(A.T @ A) / A.shape[1]
         k = np.linalg.solve(A.T @ A + ridge * np.eye(A.shape[1]), A.T @ t)
         if not np.isfinite(k).all() or k.sum() <= 0:
             return None
         k /= k.sum()  # keep the channel's overall level; only its blur changes
-        out[..., c] = sum(float(w) * b for w, b in zip(k, basis))
+        acc = np.zeros((h, w), np.float32)
+        for wgt, b in zip(k, basis(ch)):
+            acc += np.float32(wgt) * b
+        out[..., c] = acc
     return out
 
 
-def sharpen(rgb: np.ndarray, sigma: float, iters: int = 25, match_psf: bool = True) -> np.ndarray:
+def sharpen(rgb: np.ndarray, sigma: float, iters: int = 25, match_psf: bool = True, scale: float = 1.0) -> np.ndarray:
     """Deconvolve brightness only, so colour noise is not amplified.
 
     Colour is taken from blur-matched channels (see match_channel_psf) and
@@ -188,7 +213,7 @@ def sharpen(rgb: np.ndarray, sigma: float, iters: int = 25, match_psf: bool = Tr
     """
     Y = luminance(rgb).astype(np.float32)
     base, Yb = rgb, Y
-    matched = match_channel_psf(rgb) if match_psf else None
+    matched = match_channel_psf(rgb, scale) if match_psf else None
     if matched is not None:
         base = matched
         Yb = luminance(base).astype(np.float32)

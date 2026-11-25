@@ -78,7 +78,7 @@ def develop(stack_cam: np.ndarray, colour: dict, cfg: Config, say=lambda *_a, **
         say("could not measure blur on the limb; assuming a typical value")
     # Deconvolution converges more slowly when the blur spans more pixels, so
     # the iteration count is given for 1x and grows with the area of a pixel.
-    sharp = finish.sharpen(linear, sigma, int(round(cfg.sharpen_iters * scale * scale)))
+    sharp = finish.sharpen(linear, sigma, int(round(cfg.sharpen_iters * scale * scale)), scale=scale)
     info = {
         "psf_sigma_measured": measured,
         "psf_sigma_used": sigma,
